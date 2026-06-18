@@ -1,0 +1,29 @@
+{
+  "$schema": "https://hcli.docs.hex-rays.com/schemas/ida-plugin.json",
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "CFF Deobfuscator",
+    "entryPoint": "cff_deobfuscator.py",
+    "version": "1.0.0",
+    "idaVersions": ["9.0", "9.1", "9.2", "9.3"],
+    "description": "Multi-pass deobfuscator for control-flow-flattened x86-64 binaries: indirect-jump de-indirection (Layer 1), control-flow unflattening (Layer 2), and obfuscated import/API call annotation (Layer 3), applied in one resilient, idempotent pass.",
+    "license": "MIT",
+    "categories": [
+      "deobfuscation",
+      "decompilation"
+    ],
+    "keywords": [
+      "control-flow-flattening",
+      "cff",
+      "deobfuscation",
+      "unflattening",
+      "hex-rays",
+      "x86-64"
+    ],
+    "authors": [
+      {
+        "name": "CFF Plugins"
+      }
+    ]
+  }
+}
