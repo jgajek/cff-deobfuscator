@@ -13,6 +13,10 @@ obfuscated import / API calls so Hex-Rays output is meaningful again.
 > binaries from the **same** toolchain, not on arbitrary CFF. See
 > [Scope: generic vs. sample-specific](#scope-generic-vs-sample-specific).
 
+> **Documentation:** for an in-depth, novice-friendly field guide to the
+> obfuscation and how each layer undoes it — with worked examples and diagrams —
+> see [`docs/CFF-DEOBFUSCATOR.md`](docs/CFF-DEOBFUSCATOR.md).
+
 ## What it does
 
 The plugin runs three deobfuscation layers in order:
@@ -84,11 +88,12 @@ The plugin was developed and validated against a single sample:
 
 ## Installation
 
+The plugin itself lives in [`plugins/ida/`](plugins/ida/).
+
 ### Option A — automated installer (recommended)
 
-From this directory:
-
 ```bash
+cd plugins/ida
 python3 install.py
 ```
 
@@ -104,8 +109,9 @@ python3 install.py --uninstall                     # remove a previous install
 
 ### Option B — manual copy (self-contained folder)
 
-This folder is a self-contained IDA plugin (it contains `ida-plugin.json`).
-Copy the whole folder into your IDA user `plugins` directory, e.g.:
+The `plugins/ida/` folder is a self-contained IDA plugin (it contains
+`ida-plugin.json`). Copy its contents into a folder in your IDA user `plugins`
+directory, e.g.:
 
 ```
 ~/.idapro/plugins/cff-deobfuscator/
@@ -119,9 +125,9 @@ in the same directory. Restart IDA.
 
 ### Option C — load once without installing
 
-In IDA: **File > Script file…** and select `cff_deobfuscator.py`. The plugin
-adds its own directory to `sys.path`, so the `cff/` package is found as long as
-it sits next to the entry script.
+In IDA: **File > Script file…** and select `plugins/ida/cff_deobfuscator.py`.
+The plugin adds its own directory to `sys.path`, so the `cff/` package is found
+as long as it sits next to the entry script.
 
 ## Usage
 
@@ -156,14 +162,17 @@ runstate.reset()            # forget recorded progress (IDB is left untouched)
 ## Layout
 
 ```
-cff_deobfuscator.py   IDA plugin entry (PLUGIN_ENTRY, the two menu actions)
-ida-plugin.json       Plugin Manager descriptor
-install.py            Cross-platform installer / uninstaller
-cff/
-    orchestrator.py   dry_run() / full_run() multi-pass driver
-    runstate.py       netnode-backed idempotency state
-    log.py            console banners / status
-    layer1.py         Layer 1 engine (de-indirection)
-    layer2.py         Layer 2 engine (unflattening)
-    imports.py        Layer 3 engine (import / API resolver)
+plugins/ida/
+    cff_deobfuscator.py   IDA plugin entry (PLUGIN_ENTRY, the two menu actions)
+    ida-plugin.json       Plugin Manager descriptor
+    install.py            Cross-platform installer / uninstaller
+    cff/
+        orchestrator.py   dry_run() / full_run() multi-pass driver
+        runstate.py       netnode-backed idempotency state
+        log.py            console banners / status
+        layer1.py         Layer 1 engine (de-indirection)
+        layer2.py         Layer 2 engine (unflattening)
+        imports.py        Layer 3 engine (import / API resolver)
+docs/
+    CFF-DEOBFUSCATOR.md   in-depth field guide (obfuscation + deobfuscation)
 ```
