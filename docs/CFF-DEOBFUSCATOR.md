@@ -1120,6 +1120,24 @@ Now we turn classifications into bytes. The transforms are small:
 - **Conditional hop:** overwrite the selecting `cmov` region with
   `jcc <true block>` followed by `jmp <false block>`.
 
+**"But what about the instructions in between?"** A fair worry: the `mov` that
+writes the next state usually isn't the very last byte of the block — a few more
+instructions sit between it and the jump back to the dispatcher. If we drop our
+direct `jmp` right on the state-write, don't those trailing instructions get
+skipped? They do — and that's exactly what we want, *because of what they are*.
+In this obfuscation a block's last real act is to pick its next state; everything
+after that is pure bookkeeping to get back to the dispatcher (recomputing the
+dispatcher's address and jumping to it). Once our block jumps straight to its real
+successor, the dispatcher is out of the loop, so that bookkeeping is dead by
+definition. The patcher therefore doesn't just stamp 5 bytes and leave a mess: it
+overwrites the whole run from the state-write through that final jump (filling any
+slack with `nop`s), so nothing is left half-reachable. And it only does so within
+a region it has proven is **block-private** — it stops the moment it would touch a
+byte that some other block jumps to, or any dispatcher instruction. If real work
+ever sat in that tail, the region would end early and there'd be no room; rather
+than risk clipping a live instruction, the patcher simply **refuses** and leaves
+that block dispatching (more on this refuse-don't-guess stance below).
+
 The messiness is *room*. A direct jump needs 5 bytes; a conditional needs 11. The
 state-write site is often smaller. So the patcher has a ladder of strategies, in
 order of preference, each used only when it is provably safe:
