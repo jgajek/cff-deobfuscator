@@ -16,6 +16,12 @@ obfuscated import / API calls so Hex-Rays output is meaningful again.
 > **Documentation:** for an in-depth, novice-friendly field guide to the
 > obfuscation and how each layer undoes it — with worked examples and diagrams —
 > see [`docs/CFF-DEOBFUSCATOR.md`](docs/CFF-DEOBFUSCATOR.md).
+>
+> **Malware analysis:** a full capability/behavior report for the sample,
+> produced from the deobfuscated database, is in
+> [`docs/MALWARE-ANALYSIS-FortiEndpoint_Patch.md`](docs/MALWARE-ANALYSIS-FortiEndpoint_Patch.md).
+> Its string-obfuscation section is backed by the standalone string recovery
+> tool [`plugins/ida/cff_string_decoder.py`](plugins/ida/cff_string_decoder.py).
 
 ## What it does
 
@@ -164,6 +170,7 @@ runstate.reset()            # forget recorded progress (IDB is left untouched)
 ```
 plugins/ida/
     cff_deobfuscator.py   IDA plugin entry (PLUGIN_ENTRY, the two menu actions)
+    cff_string_decoder.py standalone XOR-29 string recovery (IDA + offline modes)
     ida-plugin.json       Plugin Manager descriptor
     install.py            Cross-platform installer / uninstaller
     cff/
@@ -175,4 +182,22 @@ plugins/ida/
         imports.py        Layer 3 engine (import / API resolver)
 docs/
     CFF-DEOBFUSCATOR.md   in-depth field guide (obfuscation + deobfuscation)
+    MALWARE-ANALYSIS-FortiEndpoint_Patch.md   capability/behavior analysis report
+```
+
+## String recovery tool
+
+[`plugins/ida/cff_string_decoder.py`](plugins/ida/cff_string_decoder.py) recovers
+the sample's obfuscated string pool (a 29-byte repeating-XOR scheme; see §2.1 of
+the analysis report). It has two modes:
+
+```bash
+# offline: sweep the .rdata pool straight from the PE (only `pefile` needed)
+python3 plugins/ida/cff_string_decoder.py scan FortiEndpoint_Patch.exe -o strings.txt
+```
+
+```python
+# inside IDA: faithful recovery (exact addresses) + write plaintext as comments
+import cff_string_decoder as d
+d.run_ida(annotate=True, out_json=r"C:\temp\cff_strings.json")
 ```
