@@ -794,39 +794,65 @@ def _contig_region(sm, start_ea):
     return start_ea, end - start_ea
 
 
-def _cave_region():
-    """Trailing free padding at the end of the executable CODE segment, usable
-    as a trampoline cave. Compilers align the section end with a run of 0xFF (or
-    int3) bytes that is undefined and unreferenced; we hand trampolines out of
-    it low-to-high, so the still-0xFF tail always reflects the remaining free
-    space. Returns (free_start, seg_end) or (None, None)."""
+_CAVE_SEG_NAME = ".cff_cave"
+_CAVE_SEG_SIZE = 0x80000          # 512 KiB -- thousands of replay trampolines
+
+
+def _ensure_cave_seg():
+    """Find (or create) the dedicated trampoline-cave segment.
+
+    The original cave -- the .text section's trailing alignment padding -- is
+    only a few KiB, far too little once every replayable impure dispatcher
+    wants trampolines (a single large function can need >100). So we carve a
+    generous executable segment of our own, placed just past the highest
+    existing segment and therefore still well within a rel32 (+-2 GiB) jump of
+    .text. This IDB is a static-analysis artefact, not a runnable image, so a
+    synthetic code segment is sound. Returns the segment_t or None."""
     import ida_segment
-    seg = None
+    seg = ida_segment.get_segm_by_name(_CAVE_SEG_NAME)
+    if seg is not None:
+        return seg
+    top = 0
     for i in range(ida_segment.get_segm_qty()):
         s = ida_segment.getnseg(i)
-        if (s.perm & ida_segment.SEGPERM_EXEC
-                and ida_segment.get_segm_class(s) == "CODE"):
-            seg = s
+        if s.end_ea > top:
+            top = s.end_ea
+    base = ((top + 0xFFFF) & ~0xFFFF) + 0x10000
+    if not ida_segment.add_segm(0, base, base + _CAVE_SEG_SIZE,
+                                _CAVE_SEG_NAME, "CODE"):
+        return None
+    seg = ida_segment.get_segm_by_name(_CAVE_SEG_NAME)
+    if seg is not None:
+        seg.perm = (ida_segment.SEGPERM_EXEC | ida_segment.SEGPERM_READ
+                    | ida_segment.SEGPERM_WRITE)
+        seg.bitness = 2           # 64-bit, so cave instructions decode correctly
+        seg.update()
+    return seg
+
+
+def _cave_region():
+    """Free run of the dedicated cave segment usable for the next trampoline.
+
+    Free space starts just past the highest cave already emitted (tracked in
+    the global registry, so this is O(caves) and -- crucially -- idempotent
+    across the two plan() passes of a function, whose own caves are not
+    registered until apply()). A final nudge skips any stray code item left at
+    the frontier. Returns (free_start, seg_end) or (None, None)."""
+    seg = _ensure_cave_seg()
     if seg is None:
         return None, None
-    # Free space = the trailing run of alignment padding (0xFF / int3 0xCC).
-    # Such padding may be either still-undefined OR defined as a data array
-    # (e.g. `dq dup(?)`) by auto-analysis -- both are reclaimable. We must,
-    # however, never eat into a previously-emitted trampoline: those are real
-    # instructions, so we stop at the first byte that belongs to a *code* item
-    # (even if that instruction happens to end in a 0xFF displacement byte).
-    e = seg.end_ea
-    a = e - 1
-    while a > seg.start_ea:
-        if ida_bytes.get_byte(a) not in (0xFF, 0xCC):
+    free = seg.start_ea
+    for _fs, cs, ce in _CAVE_OWNERS:
+        if seg.start_ea <= cs < seg.end_ea and ce > free:
+            free = ce
+    while free < seg.end_ea and ida_bytes.is_code(ida_bytes.get_flags(free)):
+        nh = idc.next_head(free, seg.end_ea)
+        if nh <= free:
             break
-        if ida_bytes.is_code(ida_bytes.get_flags(idc.get_item_head(a))):
-            break
-        a -= 1
-    start = a + 1
-    if e - start < 16:
+        free = nh
+    if seg.end_ea - free < 16:
         return None, None
-    return start, e
+    return free, seg.end_ea
 
 
 class Resolver(object):
@@ -2065,11 +2091,53 @@ class PerHopResolver(object):
         self._impure_cache = out
         return out
 
+    def _tree_succ(self, c, heads):
+        """Tree nodes structurally reachable in one hop from compare `c`: for
+        each of its jcc's taken target and fall-through, walk forward skipping
+        straight-line hoisted side-effects and direct jumps until a tree node
+        or a backbone head (work blocks terminate the walk). Returns the list
+        of tree nodes reached (0-2)."""
+        sm = self.sm
+        j = sm._next_jcc(c)
+        if j is None:
+            return []
+        out = []
+        for s in (_rj(idc.get_operand_value(j, 0)), idc.next_head(j, sm.FE)):
+            a = s
+            for _ in range(64):
+                a = _rj(a)
+                if a in sm.tree_cmps:
+                    out.append(a)
+                    break
+                if a in heads:
+                    break
+                mn = idc.print_insn_mnem(a)
+                if mn == "jmp" and idc.get_operand_type(a, 0) == idc.o_near:
+                    a = idc.get_operand_value(a, 0)
+                    continue
+                if mn and mn[0] == "j":      # non-tree conditional: stop
+                    break
+                nh = idc.next_head(a, sm.FE)
+                if nh == idc.BADADDR or nh < sm.FS or nh >= sm.FE:
+                    break
+                a = nh
+        return out
+
     def _tree_root(self):
         """The unique entry node of the dispatcher's binary-search tree: the
         single compare that no other tree branch (taken or fall-through) jumps
-        to. Cached. Returns None when there is no single root (multi-root or
-        irregular tree), in which case per-state path finding declines."""
+        to. Cached. Returns None when no single root can be identified.
+
+        `tree_cmps` can also capture genuine work-code compares that happen to
+        reuse the state register (e.g. a JSON parser's `cmp eax,0x22`). These
+        form small disconnected islands, each of which -- being unreachable
+        from the dispatcher -- looks like an extra root, so a naive "exactly
+        one untargeted node" test wrongly declines (root_none). When several
+        candidates remain we disambiguate structurally: the real dispatcher
+        root's subtree (taken / fall-through, skipping hoisted side-effects)
+        reaches the whole state machine, while a work island reaches only a
+        handful. We return the strictly-dominant candidate, or None when the
+        top coverage ties (genuinely ambiguous / multi-root)."""
         cache = getattr(self, "_troot_cache", "x")
         if cache != "x":
             return cache
@@ -2083,8 +2151,43 @@ class PerHopResolver(object):
                 return None
             targets.add(_rj(idc.get_operand_value(j, 0)))
             targets.add(_rj(idc.next_head(j, sm.FE)))
-        roots = [c for c in cmps if c not in targets]
-        self._troot_cache = roots[0] if len(roots) == 1 else None
+        cands = [c for c in cmps if c not in targets]
+        if not cands:
+            self._troot_cache = None
+            return None
+        if len(cands) == 1:
+            self._troot_cache = cands[0]
+            return cands[0]
+        # Several untargeted nodes: pick the one whose structural subtree
+        # covers the most tree nodes (the dispatcher), not a work island.
+        heads = set(sm.backbone.values())
+        succ = {}
+        for c in cmps:
+            succ[c] = self._tree_succ(c, heads)
+
+        def _reach(root):
+            seen = set()
+            stk = [root]
+            while stk:
+                x = stk.pop()
+                if x in seen:
+                    continue
+                seen.add(x)
+                for y in succ.get(x, ()):
+                    if y not in seen:
+                        stk.append(y)
+            return seen
+
+        best = None
+        best_n = -1
+        tie = False
+        for c in cands:
+            n = len(_reach(c))
+            if n > best_n:
+                best_n, best, tie = n, c, False
+            elif n == best_n:
+                tie = True
+        self._troot_cache = None if tie else best
         return self._troot_cache
 
     def dispatch_carried(self, S):
@@ -2492,10 +2595,10 @@ class PerHopPatcher(object):
         return anchor
 
     def _alloc_cave(self, n):
-        """Hand out `n` bytes from the .text trailing padding cave, low-to-high.
-        The high-water mark is seeded (lazily, per plan) from the current free
-        run, so repeated plans of the same function return identical addresses
-        and successive functions never overlap. Returns the start ea or None."""
+        """Hand out `n` bytes from the dedicated cave segment, low-to-high. The
+        high-water mark is seeded (lazily, per plan) from the current free run,
+        so repeated plans of the same function return identical addresses and
+        successive functions never overlap. Returns the start ea or None."""
         if self._cave_hwm is None:
             s, e = _cave_region()
             if s is None:
