@@ -204,9 +204,19 @@ class StateMachine(object):
         # switch/jump table (e.g. a byte field with several cases sharing a
         # target) collapses many states onto few heads. Require both enough
         # states and enough DISTINCT target heads to avoid that false positive.
-        if self.state_reg is None or len(self.backbone) < 3:
+        #
+        # Genuine obfuscator state numbers are LARGE random 32-bit constants
+        # (e.g. 0xD5FD561C); ordinary code compares a register against small
+        # enums/flags (1, 2, 0x88, ...). A big library function (sqlite3Select,
+        # sqlite3VdbeExec, __strtodg, ...) can otherwise fabricate a tiny
+        # all-small "backbone" that trips this gate, so require the states to be
+        # large -- only real dispatchers clear it.
+        if self.state_reg is None:
             return False
-        return len(set(self.backbone.values())) >= 3
+        big = [s for s in self.backbone if s >= 0x10000]
+        if len(big) < 3:
+            return False
+        return len({self.backbone[s] for s in big}) >= 3
 
 
 # ---------------------------------------------------------------------------
@@ -563,9 +573,12 @@ def fold_opaques_all(do_apply=True):
 #   * state dedup: identical (ip, registers) machine states are visited once, so
 #     forking cannot blow up.
 #
-# A function is patched only when its LIVE work graph (reachable from a single
-# prologue-derived entry) is fully clean: no unresolved leaves and every edge
-# has a private, in-range patch anchor. Otherwise it is left at Layer 1.
+# A jump-table function (shared computed-goto) is patched only when its LIVE
+# work graph (reachable from a single prologue-derived entry) is fully clean: no
+# unresolved leaves and every edge encodable -- at a private in-range anchor or,
+# when none fits, via a code-cave trampoline. The stack-mirror family rewrites
+# per block, so it patches every edge it can and leaves the rest dispatching.
+# Anything else is left at Layer 1.
 # ---------------------------------------------------------------------------
 _EMU_FLAGSET = set("cmp test add sub and or xor inc dec neg imul mul shl shr "
                    "sar bt adc sbb".split())
@@ -2021,68 +2034,14 @@ class PerHopResolver(object):
         return self.res.get(V, {}).get("kind") in (
             "uncond", "cond", "ret", "nway")
 
-    def _block_calls(self, head):
-        """Count real (non-stack-probe) calls reachable from a block head by
-        static intra-function flow (near jmps + both conditional arms)."""
-        sm = self.sm
-        seen = set()
-        stack = [head]
-        n = 0
-        while stack and len(seen) < 4000:
-            a = stack.pop()
-            if a in seen or not (sm.FS <= a < sm.FE):
-                continue
-            seen.add(a)
-            mn = idc.print_insn_mnem(a)
-            if mn == "call":
-                t = idc.get_operand_value(a, 0)
-                nm = idc.get_func_name(t) if t else ""
-                if "chkstk" not in (nm or ""):
-                    n += 1
-            if mn in ("ret", "retn"):
-                continue
-            if a != head and a in self.head2state:
-                continue
-            if mn == "jmp":
-                if idc.get_operand_type(a, 0) == idc.o_near:
-                    stack.append(idc.get_operand_value(a, 0))
-                continue
-            if mn and mn[0] == "j":
-                stack.append(idc.get_operand_value(a, 0))
-                stack.append(idc.next_head(a, sm.FE))
-                continue
-            stack.append(idc.next_head(a, sm.FE))
-        return n
-
-    def is_decoy(self):
-        """Detect a jump-table 'decoy' entry: the recovered live path does NO
-        real work (zero non-probe calls) yet a large unreached work component is
-        full of real calls. This is the signature of the SECOND obfuscation
-        topology (a jump-table/computed-goto dispatcher) whose real body the
-        compare-tree resolver cannot follow -- e.g. win_impl_init, whose 6-state
-        path returns immediately while its 50 unreached states hold 48 calls.
-        Such a function must NOT be patched (it would be reduced to a stub)."""
-        if not self.live:
-            return False
-        live_calls = sum(self._block_calls(self.bb[V]) for V in self.live)
-        if live_calls:
-            return False
-        dead = [V for V in getattr(self, "work", [])
-                if V not in self.live]
-        dead_calls = sum(self._block_calls(self.bb[V]) for V in dead)
-        return dead_calls >= 8
-
     def is_clean(self):
         """Clean = entry found and every LIVE (reachable) state resolves to a
         patchable edge. Backbone states that are not reachable from the entry are
         the obfuscator's opaque-false gadget blocks (fake set-state / jump
         gadgets); they are never executed and Hex-Rays drops them once the live
         edges are direct, so full backbone coverage is NOT required for a clean
-        unflattening -- only that nothing reachable is left dispatching. A
-        jump-table decoy entry is never clean (its real body is unreachable)."""
+        unflattening -- only that nothing reachable is left dispatching."""
         if not self.ok or self.S0 is None or not self.live:
-            return False
-        if self.is_decoy():
             return False
         if not all(self._patchable(V) for V in self.live):
             return False
@@ -2341,7 +2300,6 @@ class PerHopResolver(object):
                 "live": len(self.live),
                 "cond": cond, "nway": nway,
                 "entry": self.S0, "clean": self.is_clean(),
-                "decoy": self.is_decoy(),
                 "impure": len(imp),
                 "impure_instrs": sum(len(v) for v in imp.values()),
                 "jtbl": bool(self.follow_ijmp),
@@ -3209,12 +3167,6 @@ def unflatten_function(ea, do_apply=True):
         rep["applied"] = False
         rep["skip_reason"] = "no entry / empty live graph"
         return rep
-    if r.is_decoy():
-        rep["applied"] = False
-        rep["decoy"] = True
-        rep["skip_reason"] = ("jump-table decoy entry (live path does no work; "
-                              "real body behind a computed-goto dispatcher)")
-        return rep
     # Impure dispatcher: the binary-search tree carries hoisted side-effects
     # (real `mov`/`lea` into argument/key registers wedged between a state
     # compare and its jcc, e.g. `mov rdx, r12`). Unflattening rewrites each
@@ -3281,20 +3233,20 @@ def unflatten_function(ea, do_apply=True):
     # Jump-table family: every edge must get a real patch, because the shared
     # computed-goto dispatcher stays live if ANY block is left dispatching (see
     # the is_clean() gate above). is_clean() is kind-based, so it accepts a block
-    # whose edge cannot actually be encoded (no private in-range anchor -- e.g. a
-    # cmov-cond with real work wedged between the state-store and the dispatch,
-    # which needs instruction relocation we do not do). Catch that here so the
-    # function is left whole at Layer 1 instead of partially patched into a
-    # worse hybrid. (The stack-mirror family dispatches per block, so partial
-    # patching is still safe and beneficial -- it is not gated.)
+    # whose edge cannot actually be encoded even with the inline-anchor and
+    # code-cave fallbacks below -- e.g. a discriminator that is neither a cmov nor
+    # an already-direct jcc, or a hoisted side-effect that is not
+    # position-independent (so it cannot be relocated into a cave). Catch that
+    # here so the function is left whole at Layer 1 instead of partially patched
+    # into a worse hybrid. (The stack-mirror family dispatches per block, so
+    # partial patching is still safe and beneficial -- it is not gated.)
     if r.follow_ijmp and refused:
         rep["applied"] = False
         if do_apply:
             rep["folded"] = OpaqueFolder(ea).apply().get("folded", 0)
-        rep["skip_reason"] = ("jump-table family: %d live edge(s) have no "
-                              "private in-range patch anchor (real work between "
-                              "the state-store and dispatch needs instruction "
-                              "relocation); left at Layer 1 to avoid a partial "
+        rep["skip_reason"] = ("jump-table family: %d live edge(s) cannot be "
+                              "encoded even with inline-anchor and code-cave "
+                              "relocation; left at Layer 1 to avoid a partial "
                               "hybrid" % len(refused))
         return rep
     # Each hop patch is independently correct (locally equivalent to the

@@ -494,7 +494,10 @@ wire the blocks directly to each other and throw the dispatcher away.
 1. **Find the machine's parts.** The plugin locates the **state variable** (here
    it lives in the `eax` register / a stack slot) and the **dispatcher**: a
    tree of comparisons that maps each state number to its block. In
-   `reg_read_str` this backbone has **28 states** and **39** comparison nodes.
+   `reg_read_str` this backbone has **28 states** and **39** comparison nodes —
+   more comparisons than states because it is a search *tree*, not a flat list
+   (28 equality leaves pin the states; the other 11 are interior range-splits
+   that only steer the search; see §3.2.6).
 
 2. **Resolve one "hop" per block.** Starting from a block, the plugin emulates
    forward — reusing the same safe simulator from Layer 1 — until the block does
@@ -954,7 +957,11 @@ in order:
 
 With those four solved, §3.2.6 opens up the dispatcher itself — the two
 "families" of state machine this sample uses, and the one case where the
-dispatcher does real work that the rewrite must preserve.
+dispatcher does real work that the rewrite must preserve. The last three
+subsections cover the supporting machinery that makes the rewrite safe in
+practice: the **code cave** that houses relocated patches (§3.2.7), the **entry
+redirect** that must not trample the prologue (§3.2.8), and the final
+opaque-predicate **fold** (§3.2.9).
 
 Throughout, we use `reg_read_str` again. Its real, recovered facts (read live
 from the database) are: the state register is **`eax`**, there are **28 states**
@@ -1107,7 +1114,9 @@ from §3.1.2), or, when the prologue seeds the slot indirectly, by finding the o
 state in the recovered graph that reaches all the others. From the entry it walks
 the recovered edges to compute the **live** set — the blocks that actually run.
 Everything not reachable is dead opaque-gadget scaffolding that Hex-Rays will
-drop on its own.
+drop on its own. (Turning that entry state into the *first* direct jump — out of
+the prologue and into the entry block — has a subtlety of its own that we return
+to in §3.2.8, once the code cave is in hand.)
 
 > **The order dependency, made concrete.** Run this same resolver on a *pristine*
 > IDB — before Layer 1 — and it still finds the whole structure (28 states, the
@@ -1158,8 +1167,9 @@ order of preference, each used only when it is provably safe:
    that state's own block; the patcher anchors there.
 4. **Relocate to a code cave.** For an "OR-of-cmov" chain (several `cmov`s
    selecting one value) that can't fit inline at all, the patcher emits the whole
-   decision into spare padding at the end of the code section and jumps to it,
-   then attaches that cave as a function tail so Hex-Rays decompiles it inline.
+   decision into a dedicated **code-cave segment** and jumps to it, then attaches
+   that cave as a function tail so Hex-Rays decompiles it inline. That cave — what
+   it is, and why it is a segment of its own — is the subject of §3.2.7.
 
 If none of these can place a correct patch, the edge is **refused** and that
 block is left dispatching.
@@ -1190,9 +1200,13 @@ handful need extra care — we have to open that box.
 **binary search tree** of compare-and-branch instructions that narrows the state
 down the way you'd find a name in a phone book: *is the state below this value?
 go one way; otherwise go the other* — over and over, until exactly one block is
-left. Each interior node is a `cmp state, K` followed by a conditional jump; each
-leaf is an unconditional jump to a real block. The one node every search starts
-from is the **root** (we'll need that word in a moment).
+left. Every node is a `cmp state, K` followed by a branch, and the nodes come in
+two kinds. A **leaf** tests for equality (`cmp state, STATE; jz block`) and, on a
+match, jumps to that one state's block — there is one leaf per state. An
+**interior** node tests a midpoint with `<`/`>` (`cmp state, MID; jg …`) and
+resolves no state at all: it only decides which half of the tree to search next.
+The one node every search starts from is the **root** (we'll need that word
+later).
 
 ```mermaid
 flowchart TD
@@ -1204,61 +1218,114 @@ flowchart TD
     B -->|"else"| LD["jmp block #3"]
 ```
 
-For `reg_read_str` this tree is 39 comparisons routing 28 states.
+That two-kinds structure explains a count that looks wrong at first glance: for
+`reg_read_str` the tree is **39 comparisons** but only **28 states**. The 28
+equality leaves pin the 28 states to their blocks — one apiece — and the other 11
+are interior range-splits that resolve nothing; they are the binary-search
+scaffolding that reaches the right leaf in a handful of steps instead of testing
+all 28 in turn. More comparisons than states is simply what a search *tree* looks
+like, as opposed to a flat list of equality checks.
 
-**How a block gets back to the dispatcher: the two families.** Every real block
-ends with the same idea — *"I'm done; here is my next step number; take me to
-whoever owns it."* But the obfuscator builds that hand-off in two different ways,
-and the difference decides our whole strategy.
+**Two kinds of edge at the end of a block.** The tree answers "given a state,
+which block?" The other half of the loop is how a block, once it has finished its
+work, chooses the **successor state** to feed back into the tree. There are only
+two kinds of edge, and every flattened function uses just these:
 
-- **Stack-mirror family** (e.g. `reg_read_str`). The block writes its next state
-  — a plain constant — into a stack slot, then jumps to the dispatcher, which
-  reads the slot back and walks the tree. The key property: the answer is sitting
-  *right there in the block* as a `mov [slot], 0x9E454962`. We can read it
-  directly, and because every block carries its own store, we can rewrite blocks
-  **one at a time**. A block we haven't touched simply keeps using the
-  dispatcher; partial progress is always safe.
-- **Jump-table family** (e.g. `decrypt_aes_gcm`). There is no readable constant
-  store. The block computes an *index* and jumps through a **shared computed
-  goto** (`jmp rax`, where `rax` was loaded from a jump table) — the *same* goto
-  every block uses. The only way to learn where a block goes is to follow that
-  computed jump (exactly what Layer 1 resolved). And because the goto is shared,
-  you cannot half-fix it: as long as even one block still routes through it, the
-  whole table — and the flattening — stays alive. This family is therefore
-  **all-or-nothing**.
+- **Unconditional** — the block has a single successor: it names one fixed next
+  state.
+- **Conditional** — a genuine two-way branch: the block evaluates a real runtime
+  test and selects between two successor states, classically a `cmov` over two
+  state constants:
+
+```asm
+14015c4ce  test  rax, rax          ; the real condition
+14015c4d1  mov   eax, 73230F4Ch    ; successor state if the test is non-zero
+14015c4d6  mov   ecx, 0E73320A5h   ; successor state if it is zero
+14015c4db  cmovz eax, ecx          ; choose the next state
+```
+
+That is the entire skeleton: **a block does its work, names a successor state, and
+the tree dispatches to the block that owns that state** — repeated until a block
+returns. It is identical across every flattened function in the binary. Everything
+below is variation on *how* a block records that successor, and how we recover it.
+
+**The variants: how a block records its successor.** What differs between functions
+is whether a block leaves its successor somewhere we can *read* without running the
+code. That single difference sorts them into two families and decides whether we
+can clean them up one edge at a time.
+
+- **Stack-mirror family** (e.g. `reg_read_str`). The block *mirrors* its successor
+  state into a fixed stack slot — `mov [slot], 0x9E454962` — so the answer sits
+  right there in the block. We read it straight off the store, however the block
+  then loops back to the dispatcher. And because every block carries its own
+  readable store, we can rewrite blocks **one at a time**: an untouched block
+  simply keeps dispatching, so partial progress is always safe.
+
+  The most common shape in this binary is a minor variant. Instead of a slot at a
+  *fixed* stack offset (like `reg_read_str`'s `[rbp+0x94]`), the bulk of the
+  unnamed `sub_*` helpers keep the state cell at a **dynamic** stack location: the
+  prologue copies the stack pointer into a scratch register (`mov rax, rsp`) and
+  every block stores the state through that register (`mov [rax], 0x…`). The cell's
+  address is therefore wherever `rsp` happened to point — not a constant the plugin
+  can read off statically.
+
+  That only complicates the *emulator*, which needs a concrete address to track the
+  cell. It gives `rsp` a fixed stand-in value — a **sentinel** — and copies that
+  same value into the scratch register (mirroring the prologue's `mov rax, rsp`).
+  The real runtime stack address is irrelevant; all that matters is that every
+  store and load of the cell now resolves to the *same* concrete address. With the
+  cell pinned that way, the per-block machinery is identical, and these functions
+  unflatten exactly like `reg_read_str`.
+- **Jump-table family** (e.g. `decrypt_aes_gcm`). The successor is **not** left as
+  a readable constant. An unconditional edge has its successor's *address* baked
+  into a shared **jump table** and jumps straight there, bypassing the tree for
+  that one hop:
+
+```asm
+14015c378  mov   rax, [key + offset + table_base]  ; load ENCODED successor address
+14015c37c  add   rax, key2                          ; decode -> real address
+14015c37f  jmp   rax                                ; straight to the successor block
+```
+
+  (`offset` is a constant — the surrounding `cmov`s look conditional but are forced
+  by an opaque parity predicate, §3.2.3.) Conditional edges still pick a successor
+  *state*, but write it through a register-relative slot we cannot pin to a fixed
+  address. Either way there is no readable store, so the only handle on an edge is
+  to **follow** the computed jump (which Layer 1 already resolved, §2.1).
 
 ```mermaid
 flowchart LR
-    subgraph SM["stack-mirror: per-block hand-off"]
+    subgraph SM["stack-mirror: read the state off a slot"]
       direction TB
-      b1["block"] -->|"mov [slot], NEXT"| d1["dispatcher<br/>reads slot, walks tree"]
+      b1["block"] -->|"mov [slot], NEXT<br/>(readable mirror)"| d1["dispatcher<br/>reads slot, walks tree"]
       d1 --> n1["next block"]
     end
-    subgraph JT["jump-table: one shared hand-off"]
+    subgraph JT["jump-table: follow the shared table"]
       direction TB
-      b2["block"] -->|"compute index"| g["shared jmp rax<br/>(table + tree)"]
+      b2["block"] -->|"compute index"| g["shared jump table<br/>(encoded block addresses)"]
       b3["block"] -->|"compute index"| g
-      g --> n2["next block"]
+      g -->|"load slot + decode (+key)"| n2["next block"]
     end
 ```
 
-(A third, harder **dynamic stack-slot** variant reaches the state cell through a
-pointer register the prologue sets up. When its edges can't be fully recovered,
-the plugin falls back to *only* folding the opaque predicates — §3.2.7 — which
-still removes most of the clutter even though the dispatcher stays.)
+**How we recover an edge, and why one family is all-or-nothing.** The plugin
+emulates each block to its hand-off (§3.2.3): for the stack-mirror family it reads
+the successor off the store; for the jump-table family it replays the table
+arithmetic and follows the jump. Either way the buried hand-off becomes a clean
+`state → state` edge. The families part ways on whether edges can be retired
+**independently**:
 
-**Two whole-function safety gates** follow directly from this split:
-
-- **Decoy detection.** Some jump-table functions present a tiny "entry" path that
-  does no real work, while the real body (dozens of API calls) hides behind a
-  computed goto the resolver can't follow. Patching only what we can see would
-  reduce the function to a stub, so such decoys are detected (live path has zero
-  real calls, dead component has many) and **left untouched**.
-- **All-or-nothing for the jump-table family.** Because that family shares one
-  computed goto, the plugin patches it only if it can resolve and place **every**
-  live edge; otherwise it leaves the whole function at Layer 1 rather than create
-  a half-rewritten hybrid that is worse than the original. (The stack-mirror
-  family, dispatching per block, is free to make partial progress.)
+- **Stack-mirror is per-edge.** Each block's successor is a self-contained local
+  fact, so rewriting one block to jump straight to its successor is correct on its
+  own — the dispatcher stays live and keeps routing the blocks we have not touched.
+  We patch every edge we can and leave the rest dispatching; partial is a strict
+  improvement.
+- **Jump-table is all-or-nothing.** There is no independent per-edge handle: a
+  successor exists only *through* the one shared computed-goto. The flattening can
+  be retired only by resolving the whole set at once — leave a single block on the
+  shared goto and the entire structure stays live, a hybrid worse than the
+  untouched original. So the plugin patches this family only when it can place
+  **every** live edge.
 
 **When the dispatcher does real work: "impure" dispatchers.** Everything above
 assumes the dispatcher is *pure routing* — read the state, search, jump, touching
@@ -1292,11 +1359,11 @@ tree from its **root** toward that edge's successor — evaluating each
 the CPU would take — and collects every non-routing instruction it passes
 (`dispatch_carried`). If that path is clean, the edge collapses straight to its
 successor as before. If it carries hoisted work, the patcher drops a tiny **replay
-trampoline** into spare code-section padding (a "cave"): verbatim copies of those
-instructions, then a `jmp` to the real successor, and it points the edge at the
-trampoline. The successor now arrives with exactly the registers the original
-dispatcher would have left — the `mov rdx, r12` runs, the API pointer is built
-correctly, and the call decompiles right.
+trampoline** into the code cave (§3.2.7): verbatim copies of those instructions,
+then a `jmp` to the real successor, and it points the edge at the trampoline. The
+successor now arrives with exactly the registers the original dispatcher would
+have left — the `mov rdx, r12` runs, the API pointer is built correctly, and the
+call decompiles right.
 
 ```mermaid
 flowchart LR
@@ -1307,9 +1374,9 @@ flowchart LR
 Two guard-rails keep replay honest:
 
 - **Only position-independent instructions are replayed.** A copied instruction
-  must execute identically from the cave — register/immediate/frame-relative
-  moves are fine; anything rip-relative or absolute is refused (`_reloc_bytes`),
-  because its bytes would compute the wrong address in a new location.
+  must execute identically from the cave, so anything rip-relative or absolute is
+  refused rather than copied to an address where its bytes would compute the
+  wrong target. This relocation check is shared cave machinery, covered in §3.2.7.
 - **The family sets the terms.** The stack-mirror family replays per edge and
   leaves anything it can't relocate dispatching — a correct partial result. The
   jump-table family, being all-or-nothing, is unflattened only when a
@@ -1321,16 +1388,125 @@ Two guard-rails keep replay honest:
   its patch), the function is left dispatching and merely opaque-folded. Same
   stance as always: a correct, still-flattened function beats a wrong, pretty one.
 
-> **One implementation snag worth knowing.** A trampoline lives in a cave bolted
-> onto the function as an extra chunk. When the cave is the target of the *entry*
-> edge — the very first jump out of the prologue — Hex-Rays may decompile the
-> function before it has accepted the far chunk as part of it, and show the jump
-> as a spurious `JUMPOUT` into nowhere. The bytes are correct; only the
-> decompiler's cached view is stale. The patcher avoids this by letting the new
-> cave settle, rebuilding the function with its chunks attached, and clearing the
-> decompiler's cache so the next decompilation is built from the complete picture.
+#### 3.2.7 The code cave: a home for relocated patches
 
-#### 3.2.7 The finishing pass: folding opaque predicates (`OpaqueFolder`)
+Two of the rewrites above cannot be made *in place*. An OR-of-cmov decision
+(§3.2.5, rung 4) is too big for its site; a replay trampoline (§3.2.6) is brand-
+new code that was never in the function at all. Both need somewhere to live —
+real, executable bytes, reachable by an ordinary `jmp`, that become part of the
+function. That somewhere is the **code cave**.
+
+**Why a segment of its own.** A single impure jump-table function can need a
+trampoline *per edge* — easily a hundred or more — so the patcher reserves
+generous, contiguous space up front rather than scrounging for stray bytes. It
+allocates one dedicated segment (`_ensure_cave_seg`): a 512 KiB region named
+**`.cff_cave`**, placed just past the highest existing segment (so it can collide
+with nothing) yet still well within a `rel32` ±2 GB jump of `.text` (so a 5-byte
+`E9` jump can reach it). It is marked executable/readable/writable and 64-bit, so
+bytes dropped there disassemble correctly. Inventing a segment like this is sound
+precisely because the IDB is a *static-analysis artifact*, not an image we intend
+to run: nothing will ever load and execute this database, so a synthetic home for
+recovered code costs us nothing.
+
+**Handing out space without collisions.** Caves are allocated front-to-back from
+a global registry (`_CAVE_OWNERS` / `_cave_region`): each new trampoline begins
+just past the highest one already placed. The registry is global on purpose — the
+patcher runs `plan()` twice (a costing pass, then the real one), and without a
+shared high-water-mark the second pass would hand out addresses the first already
+spent. Tracking ownership globally keeps allocation **idempotent** across those
+passes, so a function always plans to the same cave addresses.
+
+**Relocating bytes correctly (`_reloc_bytes`).** Copying an instruction to a new
+address is safe only if it executes identically there. Register/immediate/frame-
+relative instructions (`mov rdx, r12`, `mov rcx, [rbp+…]`) are position-
+independent — their bytes mean the same thing anywhere — so they are copied
+verbatim. Anything **rip-relative or absolute** computes its operand from *its
+own* location, so the identical bytes in the cave would point somewhere else;
+such an instruction is rewritten for its new home, or, if it can't be, **refused**
+— which is exactly what makes the caller leave that function dispatching (§3.2.6).
+This is the relocation guard-rail the replay step relies on.
+
+**Making Hex-Rays treat the cave as part of the function.** A jump into a far
+segment would normally read as *leaving* the function. So after placing a cave the
+patcher attaches it as an extra **function chunk** (a tail), and the decompiler
+folds the relocated code back into the function body — you see it inline, not as a
+mysterious `JUMPOUT`.
+
+```mermaid
+flowchart TD
+    P["patch that can't fit in place<br/>(OR-of-cmov chain, replay trampoline)"] --> A["allocate next slot in .cff_cave<br/>(global high-water-mark)"]
+    A --> C["copy position-independent bytes<br/>(refuse rip-relative / absolute)"]
+    C --> J["append jmp back to the real successor"]
+    J --> T["attach cave as a function tail<br/>so Hex-Rays inlines it"]
+```
+
+> **One snag worth knowing.** When the cave is the target of the *entry* edge —
+> the very first jump out of the prologue (§3.2.8) — Hex-Rays may decompile the
+> function before it has accepted the far chunk, and show the jump as a spurious
+> `JUMPOUT` into nowhere. The bytes are correct; only the decompiler's cached view
+> is stale. The patcher avoids this by letting the new cave settle, rebuilding the
+> function with its chunks attached, and clearing the decompiler's cache so the
+> next decompilation is built from the complete picture.
+
+#### 3.2.8 The entry redirect: preserving the prologue
+
+Every edge in §3.2.5 was a *block-to-block* hand-off. One edge is special: the
+**entry redirect** — the first jump, out of the prologue and into the entry block.
+Recall how the machine starts (§3.2.4): the prologue writes the initial state
+number into the state slot and falls into the dispatcher, which routes that first
+state to the entry block. To unflatten, we replace "seed the state and fall into
+the dispatcher" with a direct `jmp entry`.
+
+The subtlety is *where* to stamp that jump. The prologue does more than seed the
+state — it also loads the function's loop-invariant **keys** — and the obfuscator
+does not always emit the state-store last. Here is the real `reg_read_str`
+prologue from §3.1.2:
+
+```asm
+140088af9  mov  dword ptr [rbp-...], 0D5FD561Ch   ; seed STATE = 0xD5FD561C  (the store)
+140088b00  mov  r15, 489B85B10A15A8C7h            ; decode key
+140088b0a  mov  r13, 782B82E30BD1BC4Fh            ; decode key
+140088b14  mov  r12, 7218190CEAADE73Ch            ; <-- a key the BODY needs
+   ...                                             ; more loop-invariant setup
+140088b40  mov  rax, cs:off_140307B20             ; <-- the dispatcher begins here
+```
+
+The store at `140088af9` is **not** last — the obfuscator emitted it *before* the
+prologue's loop-invariant setup. A 5-byte `jmp entry` stamped over the store would
+leap clean over `140088b00`–`140088b3b`, taking `mov r12, 7218190CEAADE73Ch` with
+it. So the jump must land *after* that setup, not on the store.
+
+**Why that is a Layer-3 disaster, not a Layer-2 one.** That `r12` is not
+dispatcher bookkeeping. It is the **import-blinding key** — the very
+`0x7218190CEAADE73C` that §3.3.1 adds to a directory value to turn an anonymous
+`call rax` into `RegOpenKeyExA`. Drop the `mov r12` and the body still *runs*, but
+every registry call in the function is now built from a garbage key. The
+decompilation looks clean; it is silently wrong; and the damage surfaces two
+layers away, as "Layer 3 can't resolve these calls." (`r13`/`r15` above feed only
+the dispatcher, so losing *those* would be harmless — but the rewrite can't tell
+which is which by register name, and `r12` is live in the body.)
+
+**Where the jump goes.** The patcher anchors the redirect at the **first
+dispatcher instruction** — the `mov reg, cs:off_<base>` that loads the state
+table, or the state-load itself — found by scanning forward from the state store
+(`_prologue_redirect_anchor`). The whole prologue runs first, sets up `r12` and
+every other body key, and only then jumps to the entry block; the leftover state
+store is dead but harmless. When the store already *is* the last prologue
+instruction, the scan stops there and the anchor is the store itself.
+
+```mermaid
+flowchart LR
+    P["prologue runs in full<br/>mov [slot], S0 (now dead) → mov r12, KEY → … all keys set"] -->|"jmp entry<br/>(anchored at dispatcher entry)"| E["entry block<br/>(r12 + every key correct)"]
+    P -.->|"dispatcher now bypassed"| D["binary-search tree"]
+```
+
+This is the §3.4 "one set of keys, three uses" theme biting back: a constant the
+prologue loads is at once a Layer-1 jump-decode key, a Layer-2 state-decode key,
+*and* a Layer-3 call-blind key — so a Layer-2 byte-patch that drops it quietly
+breaks a Layer-3 annotation. Keeping the prologue whole is what lets the three
+layers go on sharing it.
+
+#### 3.2.9 The finishing pass: folding opaque predicates (`OpaqueFolder`)
 
 After the edges are rewritten, each real block still carries the dead parity
 gadget that used to gate it. Left alone, Hex-Rays renders these as spurious
@@ -1342,10 +1518,12 @@ function and rewrites every parity branch to its proven outcome:
 
 Because `x*(x-1)` being even is an algebraic certainty — not a guessed value —
 this rewrite is provably correct. The now-dead parity arithmetic feeds nothing,
-Hex-Rays drops it, and the spurious branches vanish. This same fold is also used
-as a **standalone fallback** for the dynamic-stack-slot family, where full edge
-recovery isn't possible but folding the opaque maze alone still collapses most of
-the clutter into a readable loop.
+Hex-Rays drops it, and the spurious branches vanish. This same fold also doubles
+as a **standalone fallback** for any function the plugin deliberately leaves
+dispatching — chiefly an all-or-nothing jump-table function whose shared jump
+table it can't fully recover (§3.2.6). Folding the opaque maze alone still
+collapses most of the clutter into a readable loop, even with the dispatcher left
+in place.
 
 **The outcome.** With the live edges direct, the dispatcher unreferenced, and the
 opaque branches folded, `reg_read_str`'s 28-state hairball collapses back into the
@@ -1506,7 +1684,13 @@ deliberately reuse each other's parts rather than reinvent them:
 - The **keys** the prologue loads (§3.1.2) are simultaneously Layer 1's jump-
   decode keys, Layer 2's state-decode key, and Layer 3's call-blind keys. One set
   of constants, three uses — which is exactly why recovering them once pays off
-  across the whole pipeline.
+  across the whole pipeline. It also cuts the other way: because the layers
+  *share* those constants, a careless edit in one can break another. The prologue-
+  preservation fix (§3.2.8) is the concrete proof — `reg_read_str`'s `r12` is a
+  Layer-3 call-blind key set in the prologue, so when Layer 2's entry redirect
+  skipped that `mov r12`, Layer 3's annotations silently failed two passes later.
+  Anchoring the redirect past the prologue's setup is what keeps the shared keys
+  intact for everyone downstream.
 
 This shared core is what keeps the plugin small enough to audit while still
 handling the messy variety of a real obfuscated binary.
@@ -1538,7 +1722,7 @@ plugins/ida/
     ├── runstate.py         # idempotency / resume state          ~121 lines
     ├── log.py              # uniform console output              ~56 lines
     ├── layer1.py           # Layer 1 engine                    ~1,038 lines
-    ├── layer2.py           # Layer 2 engine                    ~2,676 lines
+    ├── layer2.py           # Layer 2 engine                    ~3,374 lines
     └── imports.py          # Layer 3 engine                    ~1,317 lines
 ```
 
