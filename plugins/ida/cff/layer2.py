@@ -323,21 +323,65 @@ def _eval_branch(mnj, S, K):
 _RELOC_OK = {"mov", "movabs", "lea", "movzx", "movsx", "movsxd"}
 
 
-def _reloc_bytes(ea):
-    """Verbatim bytes of `ea` if it is a relocatable data move (see _RELOC_OK),
-    else None. None means 'cannot safely replay this instruction in a cave'."""
+def _reloc_insn(ea, new_ea):
+    """Bytes of the data move at `ea`, rewritten so it executes correctly when
+    copied to `new_ea` (e.g. a replay trampoline in a code cave). Returns None
+    when `ea` is not a relocatable data move (see _RELOC_OK) or its addressing
+    cannot be safely relocated.
+
+    Relocation does not change an instruction's length, so callers can size a
+    cave from `get_item_size` up front and emit each instruction in a second
+    pass. Three operand cases are handled:
+
+      * register / immediate / frame-relative -- position-independent, copied
+        verbatim;
+      * rip-relative memory (`lea r, [rip+d]`, `mov r, [rip+d]`, ...) -- the
+        disp32 is recomputed for `new_ea` so it still resolves to the same
+        absolute target;
+      * absolute disp32 memory -- the address is fixed, so copied verbatim.
+
+    Anything else (a non-data-move write, an unrecognised memory form, or a
+    rip displacement that no longer fits in 32 bits) returns None.
+    """
     if idc.print_insn_mnem(ea) not in _RELOC_OK:
         return None
-    for n in (0, 1):
-        t = idc.get_operand_type(ea, n)
-        if t == idc.o_void:
+    size = idc.get_item_size(ea)
+    raw = idc.get_bytes(ea, size)
+    if not raw or len(raw) != size:
+        return None
+    insn = ida_ua.insn_t()
+    if ida_ua.decode_insn(insn, ea) <= 0:
+        return None
+    out = bytearray(raw)
+    for n in range(2):
+        op = insn.ops[n]
+        if op.type == idc.o_void:
             break
-        if t == idc.o_mem:               # absolute / rip-relative memory
-            return None
-        op = idc.print_operand(ea, n) or ""
-        if "rip" in op or "cs:" in op or "ds:" in op or "[rel " in op:
-            return None
-    return idc.get_bytes(ea, idc.get_item_size(ea))
+        if op.type != idc.o_mem:         # reg / imm / frame-relative: verbatim
+            continue
+        offb = op.offb
+        if offb <= 0 or offb + 4 > size:
+            return None                  # cannot locate a 4-byte displacement
+        target = op.addr & U64
+        d = int.from_bytes(out[offb:offb + 4], "little", signed=True)
+        if (ea + size + d) & U64 == target:          # rip-relative: fix disp32
+            nd = target - ((new_ea + size) & U64)
+            if nd < -0x80000000 or nd > 0x7FFFFFFF:
+                return None
+            out[offb:offb + 4] = (nd & U32).to_bytes(4, "little")
+        elif (d & U32) == (target & U32):            # absolute disp32: verbatim
+            continue
+        else:
+            return None                  # unrecognised memory addressing
+    return bytes(out)
+
+
+def _reloc_bytes(ea):
+    """Back-compat shim: relocatable bytes of `ea` in place (no displacement
+    change). True iff the instruction is a relocatable data move; rip-relative
+    forms are accepted here (the actual disp fix happens in `_reloc_insn` once
+    the cave address is known)."""
+    return _reloc_insn(ea, ea)
 
 
 # ---------------------------------------------------------------------------
@@ -2153,6 +2197,72 @@ class PerHopResolver(object):
                 "unresolved": len(unres)}
 
 
+_CAVE_OWNERS = []     # [(parent_fs, cave_start, cave_end)] across the whole run
+
+
+def _register_caves(fs, tails):
+    """Record every relocation cave with the function that owns it, so it can be
+    re-attached later even from a DIFFERENT function's apply()."""
+    known = set((cs, ce) for (_, cs, ce) in _CAVE_OWNERS)
+    for cs, ce in tails:
+        if (cs, ce) not in known:
+            _CAVE_OWNERS.append((fs, cs, ce))
+
+
+def _reattach_caves():
+    """Re-own every known relocation cave to its parent function, dropping any
+    stray auto-created function at a cave start first.
+
+    This is deliberately GLOBAL, not per-function: a later function's
+    auto-analysis can re-spawn a stray at an EARLIER function's cave -- in
+    particular the globally-first cave, which sits just past .text alignment
+    padding and so looks like a fresh function entry to IDA -- and that
+    function's own apply() never revisits it. Reattaching all registered caves
+    on every pass keeps the whole cave layout owned. Returns the number of
+    caves that needed (re)owning, so callers can loop until it is zero."""
+    fixed = 0
+    for fs, cs, ce in _CAVE_OWNERS:
+        pfn = ida_funcs.get_func(fs)
+        if pfn is None:
+            continue
+        owner = ida_funcs.get_func(cs)
+        if owner is not None and owner.start_ea == fs:
+            continue                          # already a tail of its parent
+        if owner is not None and owner.start_ea == cs:
+            ida_funcs.del_func(cs)            # drop the stray blocking the tail
+            pfn = ida_funcs.get_func(fs)
+        if pfn is not None:
+            ida_funcs.append_func_tail(pfn, cs, ce)
+            fixed += 1
+    return fixed
+
+
+def reattach_all_caves(rounds=4):
+    """Public finaliser: settle auto-analysis and re-own every relocation cave
+    until the layout stops changing. Run once after a full unflatten pass so no
+    cave is left detached (which would decompile as a bogus tail call into the
+    cave instead of inlined replay)."""
+    if not _CAVE_OWNERS:
+        return 0
+    total = 0
+    for _ in range(max(1, rounds)):
+        try:
+            import ida_auto
+            ida_auto.auto_wait()
+        except Exception:
+            pass
+        n = _reattach_caves()
+        total += n
+        if n == 0:
+            break
+    try:
+        import ida_hexrays
+        ida_hexrays.clear_cached_cfuncs()
+    except Exception:
+        pass
+    return total
+
+
 class PerHopPatcher(object):
     """Realise a PerHopResolver's edges as byte patches at the state-write site.
     Every patch is independently correct, so unresolved blocks are simply left
@@ -2418,16 +2528,28 @@ class PerHopPatcher(object):
             return None, "carried-nav"
         if not carried:
             return head, None
-        body = b""
+        # Size the trampoline up front (relocation never changes an
+        # instruction's length), allocate the cave, then emit each carried
+        # instruction relocated to its actual slot so rip-relative displacements
+        # resolve correctly from the cave.
+        sizes = []
         for ea in carried:
-            b = _reloc_bytes(ea)
-            if b is None:
+            if _reloc_insn(ea, ea) is None:
                 return None, "carried-nonreloc"
-            body += b
-        cave = self._alloc_cave(len(body) + 5)
+            sizes.append(idc.get_item_size(ea))
+        total = sum(sizes)
+        cave = self._alloc_cave(total + 5)
         if cave is None:
             return None, "carried-nocave"
-        jmp = _enc_jmp(cave + len(body), head)
+        body = b""
+        off = 0
+        for ea, sz in zip(carried, sizes):
+            rb = _reloc_insn(ea, cave + off)
+            if rb is None or len(rb) != sz:
+                return None, "carried-nonreloc"
+            body += rb
+            off += sz
+        jmp = _enc_jmp(cave + total, head)
         if jmp is None:
             return None, "carried-range"
         buf = body + jmp
@@ -2691,6 +2813,9 @@ class PerHopPatcher(object):
                     break
                 a += idc.get_item_size(a)
         tails = getattr(self, "_cave_tails", [])
+        # Register this function's caves globally so they can be re-owned even
+        # from a later function's apply() (whose auto-analysis can detach them).
+        _register_caves(self.sm.FS, tails)
 
         def _auto_wait():
             try:
@@ -2710,21 +2835,18 @@ class PerHopPatcher(object):
         # FS..FE, so the caves must be appended afterwards.
         ida_funcs.del_func(self.sm.FS)
         ida_funcs.add_func(self.sm.FS, self.sm.FE)
-        for cs, ce in tails:
-            pfn = ida_funcs.get_func(self.sm.FS)
-            if pfn is None:
-                continue
-            # A stray auto-created function at the cave start would block the
-            # tail append (the range would belong to another function); drop it
-            # first so the cave joins THIS function.
-            owner = ida_funcs.get_func(cs)
-            if owner is not None and owner.start_ea == cs \
-                    and owner.start_ea != self.sm.FS:
-                ida_funcs.del_func(cs)
-                pfn = ida_funcs.get_func(self.sm.FS)
-            ida_funcs.append_func_tail(pfn, cs, ce)
+        _reattach_caves()
         if tails:
-            _auto_wait()
+            # Auto-analysis run after the first attach can re-classify a
+            # `jmp cave` edge as a tail call and re-spawn a stray function at
+            # the cave start, silently detaching the tail again. Re-own ALL
+            # known caves (this function's and earlier functions') until the
+            # layout stops changing (bounded), waiting between passes so each
+            # round sees settled analysis.
+            for _ in range(4):
+                _auto_wait()
+                if _reattach_caves() == 0:
+                    break
             # An entry edge that jumps straight into a far cave is flowed before
             # the tail is owned, and `mark_cfunc_dirty` does not always evict
             # that stale view (it renders as a JUMPOUT into the cave). Drop the
@@ -3002,6 +3124,7 @@ def unflatten_function(ea, do_apply=True):
 def unflatten_all(do_apply=True):
     """Unflatten every cleanly-recoverable flattened function."""
     flat = list(iter_flattened())
+    del _CAVE_OWNERS[:]                        # fresh registry for this run
     _msg("[layer2] unflattening %d flattened function(s)\n" % len(flat))
     # Make sure even the largest de-flattened function can be decompiled
     # afterwards (Hex-Rays' default MAX_FUNCSIZE is only 64 KB).
@@ -3037,6 +3160,14 @@ def unflatten_all(do_apply=True):
             skipped.append((rep.get("name"), rep.get("skip_reason")))
             _msg("[layer2] (%d/%d) %-32s SKIP (%s)\n"
                  % (i + 1, len(flat), rep.get("name"), rep.get("skip_reason")))
+    # Final global pass: a function's auto-analysis can leave an EARLIER
+    # function's first cave detached (re-spawned as a stray past the .text
+    # alignment padding). Re-own every cave now so none decompiles as a bogus
+    # tail call into the cave instead of inlined replay.
+    if do_apply:
+        nfix = reattach_all_caves()
+        if nfix:
+            _msg("[layer2] re-owned %d detached cave(s) in final pass\n" % nfix)
     _msg("[layer2] done: %d unflattened, %d opaque-folded, %d skipped (%.1fs)\n"
          % (done, folded_only, len(skipped), time.time() - t0))
     return {"unflattened": done, "folded_only": folded_only, "skipped": skipped}
