@@ -1717,7 +1717,10 @@ class PerHopResolver(object):
         dispatcher concretely, follow jumps, and stop at the first state-store
         site -- the prologue's initial-state write. Returns (state, anchor):
         patching `anchor` -> jmp backbone[state] sends the prologue straight to
-        the entry block. A head reached with no store yields (state, None)."""
+        the entry block. The anchor is normally the store itself, but is moved
+        to the dispatcher entry when loop-invariant setup follows the store (see
+        _prologue_redirect_anchor). A head reached with no store yields
+        (state, None)."""
         sm = self.sm
         e = self.em0.clone()
         for sl in self.slots:
@@ -1735,7 +1738,7 @@ class PerHopResolver(object):
             if st is not None:
                 v = st[1] if st[0] == "imm" else e.rr(st[1])
                 if v is not None and (v & U32) in self.bb:
-                    return v & U32, a
+                    return v & U32, self._prologue_redirect_anchor(a)
                 return None, None
             if a in bbh:
                 return bbh[a], None
@@ -1766,6 +1769,45 @@ class PerHopResolver(object):
             e.do(a)
             a = idc.next_head(a, sm.FE)
         return None, None
+
+    def _prologue_redirect_anchor(self, store):
+        """The site to patch with `jmp entry`. Normally the state-store itself
+        (the last meaningful prologue instruction). But the obfuscator may emit
+        the initial-state store BEFORE the prologue's loop-invariant register
+        setup -- e.g. `mov [slot],S0` then `mov r12,<import-key>` -- and
+        overwriting the store would skip that setup, silently corrupting the
+        work blocks (observed: reg_read_str losing its registry decode key in
+        r12, leaving every RegOpenKeyEx/RegQueryValueEx call unresolved). When
+        instructions follow the store before the dispatcher entry, anchor at the
+        dispatcher entry instead, so the whole prologue still runs and falls
+        through to `jmp entry`; the now-dead state store is harmless. The
+        dispatcher entry is the first prologue instruction that loads the global
+        decode base (`mov reg, cs:off_<base_ea>`) or reads the state slot (a
+        state-load). If no such entry precedes a branch, leave the anchor at the
+        store (unchanged behaviour)."""
+        sm = self.sm
+        base_ea = self._b.base_ea
+        nh = idc.next_head(store, sm.FE)
+        if nh == idc.BADADDR or not (sm.FS <= nh < sm.FE):
+            return store
+        a = nh
+        for _ in range(400):
+            if a == idc.BADADDR or not (sm.FS <= a < sm.FE):
+                return store
+            if ((base_ea is not None
+                    and idc.get_operand_type(a, 1) == idc.o_mem
+                    and idc.get_operand_value(a, 1) == base_ea)
+                    or a in sm.state_loads):
+                # Dispatcher entry. If it sits immediately after the store, the
+                # store IS the last prologue instruction -> keep the original
+                # anchor (byte-identical to before). Otherwise move here to
+                # preserve the loop-invariant setup in between.
+                return store if a == nh else a
+            mn = idc.print_insn_mnem(a)
+            if mn == "jmp" or mn.startswith("ret") or (mn and mn[0] == "j"):
+                return store
+            a = idc.next_head(a, sm.FE)
+        return store
 
     def _covers(self, S, succ):
         seen = set()
