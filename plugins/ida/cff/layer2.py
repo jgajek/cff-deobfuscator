@@ -274,6 +274,72 @@ def _enc_jcc(at, cc, target):
     return bytes((0x0F, op)) + struct.pack("<i", disp)
 
 
+def _rj(ea, limit=8):
+    """Follow a short chain of direct near jumps (`jmp loc`) to its final
+    landing ea. Dispatcher trees often thread relay jumps between nodes; this
+    sees through them so tree navigation lands on real compares/heads."""
+    for _ in range(limit):
+        if (idc.print_insn_mnem(ea) == "jmp"
+                and idc.get_operand_type(ea, 0) == idc.o_near):
+            ea = idc.get_operand_value(ea, 0)
+        else:
+            break
+    return ea
+
+
+def _eval_branch(mnj, S, K):
+    """Decide which way `cmp state, K ; <mnj>` falls for a concrete state S.
+    Lets us walk the dispatcher's binary-search tree at analysis time and find
+    the exact routing path (and the side-effects hoisted onto it) for a given
+    backbone state. Returns True (take branch) / False (fall through), or None
+    for a mnemonic we do not model (caller then declines to navigate)."""
+    M = 0xFFFFFFFF
+    us, uk = S & M, K & M
+
+    def s32(x):
+        x &= M
+        return x - 0x100000000 if x & 0x80000000 else x
+
+    ss, sk = s32(S), s32(K)
+    return {
+        "jz": us == uk, "je": us == uk,
+        "jnz": us != uk, "jne": us != uk,
+        "jb": us < uk, "jc": us < uk, "jnae": us < uk,
+        "jae": us >= uk, "jnc": us >= uk, "jnb": us >= uk,
+        "ja": us > uk, "jnbe": us > uk,
+        "jbe": us <= uk, "jna": us <= uk,
+        "jl": ss < sk, "jnge": ss < sk,
+        "jge": ss >= sk, "jnl": ss >= sk,
+        "jg": ss > sk, "jnle": ss > sk,
+        "jle": ss <= sk, "jng": ss <= sk,
+    }.get(mnj)
+
+
+# Instructions safe to copy verbatim into a relocation trampoline: simple data
+# moves whose encodings are position-independent (register / immediate /
+# frame-relative operands only). rip-relative or absolute memory would compute
+# the wrong effective address once executed from a code cave, so it is refused
+# -- the block is then left dispatching rather than relocated wrongly.
+_RELOC_OK = {"mov", "movabs", "lea", "movzx", "movsx", "movsxd"}
+
+
+def _reloc_bytes(ea):
+    """Verbatim bytes of `ea` if it is a relocatable data move (see _RELOC_OK),
+    else None. None means 'cannot safely replay this instruction in a cave'."""
+    if idc.print_insn_mnem(ea) not in _RELOC_OK:
+        return None
+    for n in (0, 1):
+        t = idc.get_operand_type(ea, n)
+        if t == idc.o_void:
+            break
+        if t == idc.o_mem:               # absolute / rip-relative memory
+            return None
+        op = idc.print_operand(ea, n) or ""
+        if "rip" in op or "cs:" in op or "ds:" in op or "[rel " in op:
+            return None
+    return idc.get_bytes(ea, idc.get_item_size(ea))
+
+
 # ---------------------------------------------------------------------------
 # Opaque-predicate folding
 #
@@ -1906,12 +1972,15 @@ class PerHopResolver(object):
             return False
         if self.is_decoy():
             return False
-        # An impure dispatcher (hoisted side-effects in the compare tree) cannot
-        # be unflattened by edge rewriting without dropping those instructions,
-        # so it is not a clean recovery (see _impure_nodes / unflatten_function).
-        if self._impure_nodes():
+        if not all(self._patchable(V) for V in self.live):
             return False
-        return all(self._patchable(V) for V in self.live)
+        # An impure dispatcher (hoisted side-effects in the compare tree) is
+        # clean only if every live edge's hoisted instructions can be recovered
+        # and replayed verbatim onto the rewritten edge (see _replay_clean /
+        # PerHopPatcher._succ_target); otherwise the rewrite would drop them.
+        if self._impure_nodes() and not self._replay_clean():
+            return False
+        return True
 
     def _impure_nodes(self):
         """Dispatcher compare-tree nodes that carry a SIDE-EFFECT: a write to a
@@ -1952,6 +2021,119 @@ class PerHopResolver(object):
         self._impure_cache = out
         return out
 
+    def _tree_root(self):
+        """The unique entry node of the dispatcher's binary-search tree: the
+        single compare that no other tree branch (taken or fall-through) jumps
+        to. Cached. Returns None when there is no single root (multi-root or
+        irregular tree), in which case per-state path finding declines."""
+        cache = getattr(self, "_troot_cache", "x")
+        if cache != "x":
+            return cache
+        sm = self.sm
+        cmps = sm.tree_cmps
+        targets = set()
+        for c in cmps:
+            j = sm._next_jcc(c)
+            if j is None:
+                self._troot_cache = None
+                return None
+            targets.add(_rj(idc.get_operand_value(j, 0)))
+            targets.add(_rj(idc.next_head(j, sm.FE)))
+        roots = [c for c in cmps if c not in targets]
+        self._troot_cache = roots[0] if len(roots) == 1 else None
+        return self._troot_cache
+
+    def dispatch_carried(self, S):
+        """The ordered hoisted side-effect instructions the dispatcher runs on
+        its routing path to backbone state `S` -- exactly the instructions a
+        direct edge collapse to `backbone[S]` would BYPASS. Walks the tree from
+        the root, evaluating each `cmp state,K ; jcc` for this concrete S and
+        collecting every non-state register write along the taken path (both in
+        a cmp->jcc window and on the straight line between nodes).
+
+        Returns [] when the path is side-effect free, a list of instruction EAs
+        to replay otherwise, or None when the tree cannot be navigated cleanly
+        (no single root, an unmodelled/non-tree conditional, a relay loop, or
+        the path never reaches backbone[S]) -- caller then leaves it dispatching.
+        """
+        sm = self.sm
+        root = self._tree_root()
+        head = sm.backbone.get(S)
+        if root is None or head is None:
+            return None
+        sc = L1._canon_reg(sm.state_reg)
+        out = []
+        seen = set()
+        a = root
+        for _ in range(4 * len(sm.tree_cmps) + 16):
+            a = _rj(a)
+            if a == head:
+                return out
+            if a in seen:
+                return None
+            seen.add(a)
+            if a in self.tree:
+                j = sm._next_jcc(a)
+                if j is None:
+                    return None
+                K = idc.get_operand_value(a, 1)
+                w = idc.next_head(a, sm.FE)
+                while w != idc.BADADDR and w < j:
+                    if (idc.get_operand_type(w, 0) == idc.o_reg
+                            and L1._canon_reg(idc.print_operand(w, 0)) != sc):
+                        out.append(w)
+                    w = idc.next_head(w, sm.FE)
+                t = _eval_branch(idc.print_insn_mnem(j), S, K)
+                if t is None:
+                    return None
+                a = (idc.get_operand_value(j, 0) if t
+                     else idc.next_head(j, sm.FE))
+                continue
+            mn = idc.print_insn_mnem(a)
+            if mn == "jmp" and idc.get_operand_type(a, 0) == idc.o_near:
+                a = idc.get_operand_value(a, 0)
+                continue
+            if mn and mn[0] == "j":          # non-tree conditional: bail
+                return None
+            if (idc.get_operand_type(a, 0) == idc.o_reg
+                    and L1._canon_reg(idc.print_operand(a, 0)) != sc):
+                out.append(a)
+            a = idc.next_head(a, sm.FE)
+        return None
+
+    def _replay_clean(self):
+        """For an impure dispatcher: True iff EVERY live edge's hoisted
+        dispatcher side-effects can be recovered (dispatch_carried navigates the
+        tree to the target state) AND replayed verbatim (each carried
+        instruction is position-independent -- _reloc_bytes). Edges whose
+        routing path is side-effect free trivially pass.
+
+        This whole-function predicate is what lets the jump-table family be
+        unflattened despite an impure dispatcher: its shared computed-goto needs
+        every edge rewritten at once, so we only commit when the function's
+        complete set of hoisted side-effects is replayable."""
+        if self._tree_root() is None:
+            return False
+        targets = set()
+        if self.S0 is not None:
+            targets.add(self.S0)
+        for V in self.live:
+            c = self.res.get(V, {})
+            k = c.get("kind")
+            if k == "uncond":
+                targets.add(self._final(c["succ"][0]))
+            elif k == "cond":
+                targets.add(self._final(c["t"]))
+                targets.add(self._final(c["f"]))
+        for S in targets:
+            carried = self.dispatch_carried(S)
+            if carried is None:
+                return False
+            for ea in carried:
+                if _reloc_bytes(ea) is None:
+                    return False
+        return True
+
     def report(self):
         cond = sum(1 for V in self.live
                    if self.res.get(V, {}).get("kind") == "cond")
@@ -1967,6 +2149,7 @@ class PerHopResolver(object):
                 "decoy": self.is_decoy(),
                 "impure": len(imp),
                 "impure_instrs": sum(len(v) for v in imp.values()),
+                "jtbl": bool(self.follow_ijmp),
                 "unresolved": len(unres)}
 
 
@@ -2214,6 +2397,44 @@ class PerHopPatcher(object):
         self._cave_hwm = at + n
         return at
 
+    def _succ_target(self, head, used):
+        """Resolve the address an edge should actually jump to. For a normal
+        (pure-dispatcher) function this is just `head`. For an IMPURE dispatcher,
+        the routing path to `head` carries hoisted side-effects (e.g.
+        `mov rdx, r12`) that a direct jump would skip; we materialise them in a
+        code-cave trampoline -- verbatim relocatable copies followed by
+        `jmp head` -- and return the cave address so the edge runs them first.
+
+        Returns (target_ea, None) on success, or (None, reason) to refuse THIS
+        edge; the block is then left dispatching through the still-intact tree,
+        which is correct (the side-effects still run via real routing)."""
+        if not self._impure:
+            return head, None
+        st = self.r.head2state.get(head)
+        if st is None:
+            return head, None
+        carried = self.r.dispatch_carried(st)
+        if carried is None:
+            return None, "carried-nav"
+        if not carried:
+            return head, None
+        body = b""
+        for ea in carried:
+            b = _reloc_bytes(ea)
+            if b is None:
+                return None, "carried-nonreloc"
+            body += b
+        cave = self._alloc_cave(len(body) + 5)
+        if cave is None:
+            return None, "carried-nocave"
+        jmp = _enc_jmp(cave + len(body), head)
+        if jmp is None:
+            return None, "carried-range"
+        buf = body + jmp
+        self._extra.append((cave, buf, "replay->%#x" % head))
+        self._cave_tails.append((cave, cave + len(buf)))
+        return cave, None
+
     def _orcmov_chain(self, D):
         """Detect an OR-of-cmov chain ending at discriminator `D`:
             mov dst, F_imm ; [fs] cmov dst,src ; fs ; cmov dst,src ; ... ;
@@ -2390,13 +2611,21 @@ class PerHopPatcher(object):
         self._cave_tails = []
         self._cave_hwm = None
         self._cave_end = None
+        # When the dispatcher is impure, every rewritten edge must first replay
+        # the side-effects the routing tree would have run on the way to its
+        # target (see _succ_target); pure functions are byte-identical to before.
+        self._impure = bool(r._impure_nodes())
         if r.s0_site is not None and r.S0 in bb:
-            got, err = self._emit_uncond(r.s0_site, bb[r.S0], used)
-            if got:
-                used[got[0]] = got[1]
-                patches.append((got[0], got[1], "entry %#x" % r.S0))
+            tgt, terr = self._succ_target(bb[r.S0], used)
+            if tgt is None:
+                refused.append(("entry", terr))
             else:
-                refused.append(("entry", err))
+                got, err = self._emit_uncond(r.s0_site, tgt, used)
+                if got:
+                    used[got[0]] = got[1]
+                    patches.append((got[0], got[1], "entry %#x" % r.S0))
+                else:
+                    refused.append(("entry", err))
         for V in sorted(r.live):
             c = r.res.get(V, {})
             kind = c.get("kind")
@@ -2409,12 +2638,21 @@ class PerHopPatcher(object):
                 if site is None:
                     refused.append((V, "uncond-nosite"))
                     continue
-                got, err = self._emit_uncond(site, bb[r._final(c["succ"][0])],
-                                             used)
+                tgt, terr = self._succ_target(bb[r._final(c["succ"][0])], used)
+                if tgt is None:
+                    refused.append((V, terr))
+                    continue
+                got, err = self._emit_uncond(site, tgt, used)
             elif kind == "cond":
                 D = c["disc"]
-                ht = bb[r._final(c["t"])]
-                hf = bb[r._final(c["f"])]
+                ht, terr = self._succ_target(bb[r._final(c["t"])], used)
+                if ht is None:
+                    refused.append((V, terr))
+                    continue
+                hf, terr = self._succ_target(bb[r._final(c["f"])], used)
+                if hf is None:
+                    refused.append((V, terr))
+                    continue
                 mnD = idc.print_insn_mnem(D)
                 # Already-direct real jcc: the discriminator is the program's own
                 # conditional branch whose existing targets are EXACTLY the two
@@ -2452,30 +2690,57 @@ class PerHopPatcher(object):
                 if ida_ua.create_insn(a) == 0:
                     break
                 a += idc.get_item_size(a)
-        ida_funcs.del_func(self.sm.FS)
-        ida_funcs.add_func(self.sm.FS, self.sm.FE)
-        # Attach any relocation caves as function tails so Hex-Rays decompiles
-        # the trampolines as part of the function (the `jmp cave` would otherwise
-        # read as a tail call). Done after add_func, which only covers FS..FE.
-        for cs, ce in getattr(self, "_cave_tails", []):
-            pfn = ida_funcs.get_func(self.sm.FS)
-            if pfn is not None:
-                ida_funcs.append_func_tail(pfn, cs, ce)
-        if getattr(self, "_cave_tails", None):
+        tails = getattr(self, "_cave_tails", [])
+
+        def _auto_wait():
             try:
                 import ida_auto
                 ida_auto.auto_wait()
             except Exception:
                 pass
-            # appending a tail after add_func leaves any prior pseudocode cached;
-            # invalidate it so the trampoline is not shown as a stale JUMPOUT.
+
+        # Let the freshly-created cave code settle BEFORE (re)building the
+        # function. Otherwise add_func's auto-analysis can see an entry edge
+        # that jumps straight into a not-yet-analysed cave and either render it
+        # as a JUMPOUT or spawn a stray function at the cave start.
+        if tails:
+            _auto_wait()
+        # Build the function with its relocation caves attached as tails (the
+        # `jmp cave` would otherwise read as a tail call). add_func only covers
+        # FS..FE, so the caves must be appended afterwards.
+        ida_funcs.del_func(self.sm.FS)
+        ida_funcs.add_func(self.sm.FS, self.sm.FE)
+        for cs, ce in tails:
+            pfn = ida_funcs.get_func(self.sm.FS)
+            if pfn is None:
+                continue
+            # A stray auto-created function at the cave start would block the
+            # tail append (the range would belong to another function); drop it
+            # first so the cave joins THIS function.
+            owner = ida_funcs.get_func(cs)
+            if owner is not None and owner.start_ea == cs \
+                    and owner.start_ea != self.sm.FS:
+                ida_funcs.del_func(cs)
+                pfn = ida_funcs.get_func(self.sm.FS)
+            ida_funcs.append_func_tail(pfn, cs, ce)
+        if tails:
+            _auto_wait()
+            # An entry edge that jumps straight into a far cave is flowed before
+            # the tail is owned, and `mark_cfunc_dirty` does not always evict
+            # that stale view (it renders as a JUMPOUT into the cave). Drop the
+            # decompiler's cached pseudocode outright so the next decompile is
+            # rebuilt from the now-complete CFG.
             try:
                 import ida_hexrays
-                ida_hexrays.mark_cfunc_dirty(self.sm.FS)
+                ida_hexrays.clear_cached_cfuncs()
             except Exception:
-                pass
+                try:
+                    import ida_hexrays
+                    ida_hexrays.mark_cfunc_dirty(self.sm.FS)
+                except Exception:
+                    pass
         return {"patched": len(patches), "refused": refused,
-                "caves": len(getattr(self, "_cave_tails", []))}
+                "caves": len(tails)}
 
 
 # ---------------------------------------------------------------------------
@@ -2565,8 +2830,12 @@ def _short(rep):
     if not rep.get("recover_ok"):
         return "recover failed: %s" % rep.get("recover_reason")
     if rep.get("impure"):
-        tag = ("skip(impure: %d dispatcher side-effect instr(s) -> left "
-               "dispatching)" % rep.get("impure_instrs", 0))
+        if rep.get("jtbl"):
+            tag = ("impure-jtbl: %d dispatcher side-effect instr(s) -> "
+                   "deferred, left dispatching" % rep.get("impure_instrs", 0))
+        else:
+            tag = ("impure-stack: %d dispatcher side-effect instr(s) -> "
+                   "side-effect replay on apply" % rep.get("impure_instrs", 0))
     else:
         tag = "CLEAN" if rep.get("clean") else "skip(unclean)"
     return ("states=%d work=%d live=%d cond=%d entry=%s %s"
@@ -2633,27 +2902,40 @@ def unflatten_function(ea, do_apply=True):
     # then we refuse to collapse the edges and leave the function dispatching,
     # opaque-folding the dead parity gadgets for readability (always sound).
     imp = r._impure_nodes()
-    if imp:
-        nse = sum(len(v) for v in imp.values())
+    rep["impure"] = len(imp)
+    rep["impure_instrs"] = sum(len(v) for v in imp.values())
+    if imp and r.follow_ijmp and not r._replay_clean():
+        # Jump-table family with an impure dispatcher we CANNOT fully replay
+        # (no single tree root, an unmodelled branch on the routing path, or a
+        # hoisted instruction that is not position-independent). Its computed-
+        # goto tree is SHARED by every state, so unflattening needs every edge
+        # rewritten at once; a partial mix would keep the shared tree live and
+        # produce a worse hybrid. Refuse and only opaque-fold the dead parity
+        # gadgets for readability (always sound).
+        nse = rep["impure_instrs"]
         rep["applied"] = False
-        rep["impure"] = len(imp)
-        rep["impure_instrs"] = nse
         if do_apply:
             rep["folded"] = OpaqueFolder(ea).apply().get("folded", 0)
             rep["skip_reason"] = (
-                "dispatcher has %d impure node(s) carrying %d hoisted "
-                "side-effect instruction(s) (e.g. argument/key setup like "
-                "`mov rdx, r12`); collapsing edges would bypass them, so the "
-                "function is left dispatching; opaque-folded %d predicate(s) "
-                "instead" % (len(imp), nse, rep["folded"]))
+                "jump-table dispatcher has %d impure node(s) carrying %d "
+                "hoisted side-effect instruction(s) that cannot be fully "
+                "replayed (no single tree root / non-relocatable setup); "
+                "shared computed-goto left dispatching, opaque-folded %d "
+                "predicate(s)" % (len(imp), nse, rep["folded"]))
         else:
             rep["would_fold"] = len(OpaqueFolder(ea).plan())
             rep["skip_reason"] = (
-                "dispatcher has %d impure node(s) carrying %d hoisted "
-                "side-effect instruction(s); would leave dispatching and "
-                "opaque-fold %d predicate(s)"
-                % (len(imp), nse, rep["would_fold"]))
+                "jump-table dispatcher has %d impure node(s) not fully "
+                "replayable; would leave dispatching and opaque-fold %d "
+                "predicate(s)" % (len(imp), rep["would_fold"]))
         return rep
+    # Otherwise an impure dispatcher falls through to the patcher, which replays
+    # each rewritten edge's hoisted side-effects via a code-cave trampoline
+    # (_succ_target). The stack-mirror family dispatches per block, so any edge
+    # it cannot replay is simply left dispatching through the intact tree. The
+    # jump-table family shares one computed-goto, so it is admitted here only
+    # when _replay_clean() proved the WHOLE function replayable (and the
+    # post-plan refused-gate below still enforces full edge coverage).
     # Jump-table family: the computed-goto dispatcher is SHARED by every state,
     # so a single unresolved block keeps the whole compare tree (and thus the
     # flattening) reachable -- partial patches then produce a worse hybrid than
@@ -2684,6 +2966,8 @@ def unflatten_function(ea, do_apply=True):
     # patching is still safe and beneficial -- it is not gated.)
     if r.follow_ijmp and refused:
         rep["applied"] = False
+        if do_apply:
+            rep["folded"] = OpaqueFolder(ea).apply().get("folded", 0)
         rep["skip_reason"] = ("jump-table family: %d live edge(s) have no "
                               "private in-range patch anchor (real work between "
                               "the state-store and dispatch needs instruction "
