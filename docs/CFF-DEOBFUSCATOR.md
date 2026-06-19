@@ -952,6 +952,10 @@ in order:
 3. **Resolve each hop** — from a block, where does control *really* go next?
 4. **Rewrite** — turn each state-write into a direct jump, then clean up.
 
+With those four solved, §3.2.6 opens up the dispatcher itself — the two
+"families" of state machine this sample uses, and the one case where the
+dispatcher does real work that the rewrite must preserve.
+
 Throughout, we use `reg_read_str` again. Its real, recovered facts (read live
 from the database) are: the state register is **`eax`**, there are **28 states**
 wired together by a **39-comparison** dispatcher tree, the entry state is
@@ -1019,10 +1023,12 @@ Two neighbouring globals (at base+8 and base+16) decode the same way into an
 "operand" buffer and the computed-goto **jump table**. These three regions are
 recorded as **trusted memory** — addresses that belong to the dispatcher
 machinery rather than to the program's real data. (That distinction is the key to
-the next step.) The plugin handles three families of this layout: the **global
-base+key** form above, a **stack-mirror** form where the state is also written to
-a stack cell, and a **dynamic stack-slot** form addressed through a pointer
-register. `reg_read_str` is the stack-mirror family.
+the next step.) The plugin handles three ways this state cell can be *addressed*:
+the **global base+key** form above; a **stack-mirror** form where the next state
+is also written to a stack cell; and a **dynamic stack-slot** form reached through
+a pointer register. (These addressing forms line up with the dispatcher
+"families" we dissect in §3.2.6, which is where the distinction starts to matter.)
+`reg_read_str` uses the stack-mirror form.
 
 #### 3.2.3 The crux: telling opaque branches from real ones (`EmuM`)
 
@@ -1138,26 +1144,6 @@ ever sat in that tail, the region would end early and there'd be no room; rather
 than risk clipping a live instruction, the patcher simply **refuses** and leaves
 that block dispatching (more on this refuse-don't-guess stance below).
 
-**One subtler twist: an "impure" dispatcher.** The reasoning above is about the
-*block's own* tail. But the dispatcher itself is supposed to be pure routing —
-read the state, binary-search to the matching block, jump. Occasionally the
-obfuscator cheats and *hoists a real instruction into the search tree*, tucking
-something like `mov rdx, r12` (setting up an API argument or a decode key)
-between a `cmp state, K` and its `jcc`. That instruction then runs as a side
-effect of *routing*, for every state in that branch of the tree — and the work
-blocks downstream quietly depend on it. If we collapse those blocks straight to
-their successors, we route *around* the tree, and that hoisted setup never runs;
-the block executes with the wrong register contents (e.g. an API pointer built
-from leftover opaque math instead of the real key). That is not a dead-tail
-problem the block-private region can catch — the dropped instruction lives in the
-*dispatcher*, not the block. So Layer 2 scans each dispatcher for these impure
-nodes up front, and if it finds any it declines to unflatten that function at
-all, leaving it dispatching (and merely opaque-folding the dead parity branches
-for readability). Same stance as everywhere else: a correct, still-flattened
-function beats a wrong, pretty one. Faithfully *replaying* those hoisted
-side-effects onto the rewritten edges (so such functions can be unflattened too)
-is a planned extension.
-
 The messiness is *room*. A direct jump needs 5 bytes; a conditional needs 11. The
 state-write site is often smaller. So the patcher has a ladder of strategies, in
 order of preference, each used only when it is provably safe:
@@ -1189,22 +1175,162 @@ flowchart TD
     S -- "no" --> X["refuse: leave dispatching"]
 ```
 
-**Two whole-function safety gates** sit above all this:
+Above this per-edge work sit two **whole-function** decisions — when to patch a
+function at all, and how to handle a dispatcher that does real work. Both depend
+on which *family* the dispatcher belongs to, so we look at families next.
 
-- **Decoy detection.** In the jump-table family, some functions present a tiny
-  "entry" path that does no real work while the real body (dozens of API calls)
-  hides behind a computed-goto the resolver can't follow. Patching that would
+#### 3.2.6 The dispatcher up close: families and hoisted side-effects
+
+So far we have treated the dispatcher as a black box: "it reads the state and
+jumps to the right block." To explain the last few wrinkles — why some functions
+can be cleaned up one edge at a time while others are all-or-nothing, and why a
+handful need extra care — we have to open that box.
+
+**What the dispatcher actually is.** It is not a single table lookup. It is a
+**binary search tree** of compare-and-branch instructions that narrows the state
+down the way you'd find a name in a phone book: *is the state below this value?
+go one way; otherwise go the other* — over and over, until exactly one block is
+left. Each interior node is a `cmp state, K` followed by a conditional jump; each
+leaf is an unconditional jump to a real block. The one node every search starts
+from is the **root** (we'll need that word in a moment).
+
+```mermaid
+flowchart TD
+    R["cmp state, K0"] -->|"below"| A["cmp state, K1"]
+    R -->|"not below"| B["cmp state, K2"]
+    A -->|"equal"| LA["jmp block #5"]
+    A -->|"else"| LB["jmp block #12"]
+    B -->|"equal"| LC["jmp block #20"]
+    B -->|"else"| LD["jmp block #3"]
+```
+
+For `reg_read_str` this tree is 39 comparisons routing 28 states.
+
+**How a block gets back to the dispatcher: the two families.** Every real block
+ends with the same idea — *"I'm done; here is my next step number; take me to
+whoever owns it."* But the obfuscator builds that hand-off in two different ways,
+and the difference decides our whole strategy.
+
+- **Stack-mirror family** (e.g. `reg_read_str`). The block writes its next state
+  — a plain constant — into a stack slot, then jumps to the dispatcher, which
+  reads the slot back and walks the tree. The key property: the answer is sitting
+  *right there in the block* as a `mov [slot], 0x9E454962`. We can read it
+  directly, and because every block carries its own store, we can rewrite blocks
+  **one at a time**. A block we haven't touched simply keeps using the
+  dispatcher; partial progress is always safe.
+- **Jump-table family** (e.g. `decrypt_aes_gcm`). There is no readable constant
+  store. The block computes an *index* and jumps through a **shared computed
+  goto** (`jmp rax`, where `rax` was loaded from a jump table) — the *same* goto
+  every block uses. The only way to learn where a block goes is to follow that
+  computed jump (exactly what Layer 1 resolved). And because the goto is shared,
+  you cannot half-fix it: as long as even one block still routes through it, the
+  whole table — and the flattening — stays alive. This family is therefore
+  **all-or-nothing**.
+
+```mermaid
+flowchart LR
+    subgraph SM["stack-mirror: per-block hand-off"]
+      direction TB
+      b1["block"] -->|"mov [slot], NEXT"| d1["dispatcher<br/>reads slot, walks tree"]
+      d1 --> n1["next block"]
+    end
+    subgraph JT["jump-table: one shared hand-off"]
+      direction TB
+      b2["block"] -->|"compute index"| g["shared jmp rax<br/>(table + tree)"]
+      b3["block"] -->|"compute index"| g
+      g --> n2["next block"]
+    end
+```
+
+(A third, harder **dynamic stack-slot** variant reaches the state cell through a
+pointer register the prologue sets up. When its edges can't be fully recovered,
+the plugin falls back to *only* folding the opaque predicates — §3.2.7 — which
+still removes most of the clutter even though the dispatcher stays.)
+
+**Two whole-function safety gates** follow directly from this split:
+
+- **Decoy detection.** Some jump-table functions present a tiny "entry" path that
+  does no real work, while the real body (dozens of API calls) hides behind a
+  computed goto the resolver can't follow. Patching only what we can see would
   reduce the function to a stub, so such decoys are detected (live path has zero
   real calls, dead component has many) and **left untouched**.
-- **All-or-nothing for the jump-table family.** That family shares one
-  computed-goto dispatcher across every state, so a single unresolved block keeps
-  the whole flattening alive — a partial patch would make things *worse*. There,
-  the plugin patches only if it can resolve and place **every** live edge;
-  otherwise it leaves the function at Layer 1. (The stack-mirror family, like
-  `reg_read_str`, dispatches per-block, so partial patching is safe and is
-  allowed.)
+- **All-or-nothing for the jump-table family.** Because that family shares one
+  computed goto, the plugin patches it only if it can resolve and place **every**
+  live edge; otherwise it leaves the whole function at Layer 1 rather than create
+  a half-rewritten hybrid that is worse than the original. (The stack-mirror
+  family, dispatching per block, is free to make partial progress.)
 
-#### 3.2.6 The finishing pass: folding opaque predicates (`OpaqueFolder`)
+**When the dispatcher does real work: "impure" dispatchers.** Everything above
+assumes the dispatcher is *pure routing* — read the state, search, jump, touching
+nothing else. Occasionally the obfuscator cheats and **hoists a real instruction
+into the search tree**, tucking something like `mov rdx, r12` (setting up an API
+argument or a decode key) *between* a `cmp` and its conditional jump:
+
+```asm
+; a dispatcher tree node — but with real work smuggled in
+14008ca0  cmp  eax, 0x8BE2EB16     ; routing compare
+14008ca5  mov  rdx, r12            ; <-- HOISTED real work (sets an API key)
+14008ca8  jg   loc_...             ; routing branch
+```
+
+That `mov` runs as a *side effect of routing* — every state whose search passes
+through this node gets it, and the blocks downstream quietly depend on it. Now
+recall what our edge rewrite does: it sends a block **straight to its successor**,
+cutting the dispatcher out of the loop. For a pure dispatcher that loses nothing.
+But for an impure one it routes *around* the hoisted `mov`, so the successor runs
+with the wrong register contents — an API pointer built from leftover opaque math
+instead of the real key, and a decompilation that is subtly, dangerously wrong.
+This is not the dead-tail problem from §3.2.5: the dropped instruction lives in
+the *dispatcher*, not the block, so the block-private region can't see it. Layer 2
+therefore scans every dispatcher for these impure nodes up front
+(`PerHopResolver._impure_nodes`).
+
+**The fix: replay.** Rather than refuse these functions, we *replay* the work the
+dispatcher would have done. For each rewritten edge, the patcher walks the search
+tree from its **root** toward that edge's successor — evaluating each
+`cmp state, K` against the successor's known state number to follow the exact path
+the CPU would take — and collects every non-routing instruction it passes
+(`dispatch_carried`). If that path is clean, the edge collapses straight to its
+successor as before. If it carries hoisted work, the patcher drops a tiny **replay
+trampoline** into spare code-section padding (a "cave"): verbatim copies of those
+instructions, then a `jmp` to the real successor, and it points the edge at the
+trampoline. The successor now arrives with exactly the registers the original
+dispatcher would have left — the `mov rdx, r12` runs, the API pointer is built
+correctly, and the call decompiles right.
+
+```mermaid
+flowchart LR
+    BLK["block (finished its work)"] -->|"direct jmp"| TR["replay trampoline (code cave)<br/>mov rdx, r12<br/>jmp successor"]
+    TR --> SUC["successor block<br/>(correct registers)"]
+```
+
+Two guard-rails keep replay honest:
+
+- **Only position-independent instructions are replayed.** A copied instruction
+  must execute identically from the cave — register/immediate/frame-relative
+  moves are fine; anything rip-relative or absolute is refused (`_reloc_bytes`),
+  because its bytes would compute the wrong address in a new location.
+- **The family sets the terms.** The stack-mirror family replays per edge and
+  leaves anything it can't relocate dispatching — a correct partial result. The
+  jump-table family, being all-or-nothing, is unflattened only when a
+  whole-function check (`_replay_clean`) proves *every* edge's hoisted work is
+  recoverable and relocatable. When it holds — as for `decrypt_aes_gcm`, whose
+  dispatcher hoists eight `mov rcx/rdx, [rbp+…]` argument loads — the function
+  unflattens completely, shared dispatcher and all. When it doesn't (no single
+  tree root, a rip-relative hoisted `lea`, or a conditional edge with no room for
+  its patch), the function is left dispatching and merely opaque-folded. Same
+  stance as always: a correct, still-flattened function beats a wrong, pretty one.
+
+> **One implementation snag worth knowing.** A trampoline lives in a cave bolted
+> onto the function as an extra chunk. When the cave is the target of the *entry*
+> edge — the very first jump out of the prologue — Hex-Rays may decompile the
+> function before it has accepted the far chunk as part of it, and show the jump
+> as a spurious `JUMPOUT` into nowhere. The bytes are correct; only the
+> decompiler's cached view is stale. The patcher avoids this by letting the new
+> cave settle, rebuilding the function with its chunks attached, and clearing the
+> decompiler's cache so the next decompilation is built from the complete picture.
+
+#### 3.2.7 The finishing pass: folding opaque predicates (`OpaqueFolder`)
 
 After the edges are rewritten, each real block still carries the dead parity
 gadget that used to gate it. Left alone, Hex-Rays renders these as spurious
