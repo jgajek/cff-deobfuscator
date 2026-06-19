@@ -846,10 +846,10 @@ def _cave_region():
         if seg.start_ea <= cs < seg.end_ea and ce > free:
             free = ce
     while free < seg.end_ea and ida_bytes.is_code(ida_bytes.get_flags(free)):
-        nh = idc.next_head(free, seg.end_ea)
-        if nh <= free:
-            break
-        free = nh
+        # Step past this stray code item by its own size. (next_head() can't be
+        # used: past the final defined item it returns BADADDR, which would mark
+        # the whole tail -- in fact the entire free run -- as unusable.)
+        free += max(1, idc.get_item_size(free))
     if seg.end_ea - free < 16:
         return None, None
     return free, seg.end_ea
@@ -2213,6 +2213,12 @@ class PerHopResolver(object):
         seen = set()
         a = root
         for _ in range(4 * len(sm.tree_cmps) + 16):
+            # Test for the head BEFORE _rj: a backbone head can itself be a relay
+            # `jmp loc` (the leaf's equal-arm fall-through), and _rj would follow
+            # it straight past the head into the work block, so the walk would
+            # never recognise it had arrived.
+            if a == head:
+                return out
             a = _rj(a)
             if a == head:
                 return out
@@ -2792,11 +2798,56 @@ class PerHopPatcher(object):
         self._cave_tails.append((cave, cave + len(buf)))
         return (anchor, anchor_code)
 
+    def _emit_cond_jcc_cave(self, D, head_t, head_f, used):
+        """Realise a cond edge whose discriminator is the program's own `jcc`
+        (not a cmov) in an IMPURE dispatcher. Here the in-place jcc already
+        branches to the two successor heads, but side-effect replay means each
+        edge must instead reach a replay cave (head_t / head_f are those caves),
+        and a single jcc cannot redirect both its taken AND fall-through edges.
+
+        Overwrite just the jcc with `jmp cave` and emit the two-way decision in
+        the cave (`jcc head_t ; jmp head_f`). The flags the cave's jcc consumes
+        are still those set by the in-place compare: only `jmp cave` runs in
+        between, and `jmp` preserves EFLAGS. Returns (anchor, code) and records
+        the cave bytes / tail on self, or None to refuse the edge."""
+        sm = self.sm
+        mn = idc.print_insn_mnem(D)
+        if not (mn and mn[0] == "j" and not mn.startswith("cmov")):
+            return None
+        cc = mn[1:]
+        if cc not in _JCC_OP:
+            return None
+        cave = self._alloc_cave(6 + 5)
+        if cave is None:
+            return None
+        jc = _enc_jcc(cave, cc, head_t)
+        if jc is None:
+            return None
+        jf = _enc_jmp(cave + len(jc), head_f)
+        if jf is None:
+            return None
+        buf = jc + jf
+        jin = _enc_jmp(D, cave)
+        if jin is None:
+            return None
+        rs, room = _contig_region(sm, D)
+        if rs != D or len(jin) > room or D in used:
+            return None
+        anchor_code = jin + b"\x90" * (room - len(jin))
+        self._extra.append((cave, buf, "cond-jcc-cave %#x" % D))
+        self._cave_tails.append((cave, cave + len(buf)))
+        return (D, anchor_code)
+
     def _emit_cond(self, D, head_t, head_f, used, V=None):
         mn = idc.print_insn_mnem(D)
         if not mn.startswith("cmov"):
-            # Only cmov discriminators are realised by overwriting; a real jcc
-            # that already targets the heads is handled (no-op) in plan().
+            # A real jcc whose existing targets are EXACTLY the two heads is a
+            # no-op handled in plan(). It only reaches here when side-effect
+            # replay forces both edges through caves; relocate the decision.
+            if mn and mn[0] == "j":
+                got = self._emit_cond_jcc_cave(D, head_t, head_f, used)
+                if got is not None:
+                    return got, None
             return None, "cond-notcmov"
         cc = mn[4:]
         # Try the tight cmov site first so every function that already patched
