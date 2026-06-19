@@ -2754,7 +2754,7 @@ class PerHopPatcher(object):
         ops.append(("jmp_f",))
         return anchor, ops, f_imm
 
-    def _emit_cond_cave(self, D, head_t, head_f, used):
+    def _emit_cond_cave(self, D, head_t, head_f, used, raw_hf=None):
         """Realise an OR-of-cmov cond via a code-cave trampoline: patch the
         chain's `mov dst,F` anchor with `jmp cave`, and emit the full decision
         (`jcc T` per condition, with intervening compares copied verbatim, then
@@ -2766,8 +2766,12 @@ class PerHopPatcher(object):
         if ch is None:
             return None
         anchor, ops, f_imm = ch
-        # sanity: the default (F) arm must map to head_f
-        if r.bb.get(r._final(f_imm)) != head_f:
+        # Sanity: the default (F) arm's state constant must map to the F edge's
+        # head. Compare against the RAW head -- for an impure dispatcher head_f
+        # is the _succ_target replay cave, not the backbone head, so it would
+        # never equal a raw bb lookup. The cave still jumps to head_f (the cave),
+        # so side-effects on the F edge are replayed; only this check needs raw.
+        if r.bb.get(r._final(f_imm)) != (raw_hf if raw_hf is not None else head_f):
             return None
         size = sum(6 if op[0] == "jcc" else (op[2] if op[0] == "copy" else 5)
                    for op in ops)
@@ -2838,7 +2842,7 @@ class PerHopPatcher(object):
         self._cave_tails.append((cave, cave + len(buf)))
         return (D, anchor_code)
 
-    def _emit_cond(self, D, head_t, head_f, used, V=None):
+    def _emit_cond(self, D, head_t, head_f, used, V=None, raw_hf=None):
         mn = idc.print_insn_mnem(D)
         if not mn.startswith("cmov"):
             # A real jcc whose existing targets are EXACTLY the two heads is a
@@ -2872,7 +2876,7 @@ class PerHopPatcher(object):
             # OR-of-cmov chain (>=2 cmovs select one true value, default false):
             # no inline anchor can hold the multi-condition test; relocate the
             # whole decision to a code cave reached by `jmp cave`.
-            got4 = self._emit_cond_cave(D, head_t, head_f, used)
+            got4 = self._emit_cond_cave(D, head_t, head_f, used, raw_hf)
             if got4 is not None:
                 return got4, None
         return got, err
@@ -2940,7 +2944,8 @@ class PerHopPatcher(object):
                         and idc.get_operand_value(D, 0) == ht
                         and idc.next_head(D, self.sm.FE) == hf):
                     continue
-                got, err = self._emit_cond(D, ht, hf, used, V)
+                got, err = self._emit_cond(D, ht, hf, used, V,
+                                           raw_hf=bb[r._final(c["f"])])
             else:
                 refused.append((V, kind))
                 continue
