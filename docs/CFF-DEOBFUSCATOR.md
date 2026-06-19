@@ -1138,6 +1138,26 @@ ever sat in that tail, the region would end early and there'd be no room; rather
 than risk clipping a live instruction, the patcher simply **refuses** and leaves
 that block dispatching (more on this refuse-don't-guess stance below).
 
+**One subtler twist: an "impure" dispatcher.** The reasoning above is about the
+*block's own* tail. But the dispatcher itself is supposed to be pure routing —
+read the state, binary-search to the matching block, jump. Occasionally the
+obfuscator cheats and *hoists a real instruction into the search tree*, tucking
+something like `mov rdx, r12` (setting up an API argument or a decode key)
+between a `cmp state, K` and its `jcc`. That instruction then runs as a side
+effect of *routing*, for every state in that branch of the tree — and the work
+blocks downstream quietly depend on it. If we collapse those blocks straight to
+their successors, we route *around* the tree, and that hoisted setup never runs;
+the block executes with the wrong register contents (e.g. an API pointer built
+from leftover opaque math instead of the real key). That is not a dead-tail
+problem the block-private region can catch — the dropped instruction lives in the
+*dispatcher*, not the block. So Layer 2 scans each dispatcher for these impure
+nodes up front, and if it finds any it declines to unflatten that function at
+all, leaving it dispatching (and merely opaque-folding the dead parity branches
+for readability). Same stance as everywhere else: a correct, still-flattened
+function beats a wrong, pretty one. Faithfully *replaying* those hoisted
+side-effects onto the rewritten edges (so such functions can be unflattened too)
+is a planned extension.
+
 The messiness is *room*. A direct jump needs 5 bytes; a conditional needs 11. The
 state-write site is often smaller. So the patcher has a ladder of strategies, in
 order of preference, each used only when it is provably safe:

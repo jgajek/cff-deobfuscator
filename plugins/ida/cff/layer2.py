@@ -1906,7 +1906,51 @@ class PerHopResolver(object):
             return False
         if self.is_decoy():
             return False
+        # An impure dispatcher (hoisted side-effects in the compare tree) cannot
+        # be unflattened by edge rewriting without dropping those instructions,
+        # so it is not a clean recovery (see _impure_nodes / unflatten_function).
+        if self._impure_nodes():
+            return False
         return all(self._patchable(V) for V in self.live)
+
+    def _impure_nodes(self):
+        """Dispatcher compare-tree nodes that carry a SIDE-EFFECT: a write to a
+        register other than the state register, wedged between a
+        `cmp state_reg, imm` and its controlling jcc.
+
+        The obfuscator sometimes hoists real instructions -- API-argument or
+        decode-key setup such as `mov rdx, r12` -- into the binary-search
+        dispatcher, so they execute as a side effect of *routing* rather than
+        inside the work block. Our normal unflattening collapses each block
+        straight to `backbone[next_state]`, which BYPASSES the dispatcher and
+        therefore drops these instructions; the work block then runs with the
+        wrong register state (e.g. a blinded API pointer computed from leftover
+        opaque math instead of the real key). A function whose dispatcher has
+        any such node cannot be safely unflattened by edge rewriting alone, so
+        it is left dispatching (correctness-first; see unflatten_function).
+
+        Cached. Returns {cmp_ea: [side_effect_ea, ...]}."""
+        cache = getattr(self, "_impure_cache", None)
+        if cache is not None:
+            return cache
+        sm = self.sm
+        sc = L1._canon_reg(sm.state_reg)
+        out = {}
+        for c in sm.tree_cmps:
+            jcc = sm._next_jcc(c)
+            if jcc is None:
+                continue
+            se = []
+            a = idc.next_head(c, sm.FE)
+            while a != idc.BADADDR and a < jcc:
+                if (idc.get_operand_type(a, 0) == idc.o_reg
+                        and L1._canon_reg(idc.print_operand(a, 0)) != sc):
+                    se.append(a)
+                a = idc.next_head(a, sm.FE)
+            if se:
+                out[c] = se
+        self._impure_cache = out
+        return out
 
     def report(self):
         cond = sum(1 for V in self.live
@@ -1914,12 +1958,15 @@ class PerHopResolver(object):
         nway = sum(1 for V in self.live
                    if self.res.get(V, {}).get("kind") == "nway")
         unres = [V for V in self.live if not self._patchable(V)]
+        imp = self._impure_nodes()
         return {"name": self.sm.name, "states": len(self.bb),
                 "work": len(getattr(self, "work", self.bb)),
                 "live": len(self.live),
                 "cond": cond, "nway": nway,
                 "entry": self.S0, "clean": self.is_clean(),
                 "decoy": self.is_decoy(),
+                "impure": len(imp),
+                "impure_instrs": sum(len(v) for v in imp.values()),
                 "unresolved": len(unres)}
 
 
@@ -2517,7 +2564,11 @@ def _short(rep):
         return "not flattened"
     if not rep.get("recover_ok"):
         return "recover failed: %s" % rep.get("recover_reason")
-    tag = "CLEAN" if rep.get("clean") else "skip(unclean)"
+    if rep.get("impure"):
+        tag = ("skip(impure: %d dispatcher side-effect instr(s) -> left "
+               "dispatching)" % rep.get("impure_instrs", 0))
+    else:
+        tag = "CLEAN" if rep.get("clean") else "skip(unclean)"
     return ("states=%d work=%d live=%d cond=%d entry=%s %s"
             % (rep.get("states", 0), rep.get("work", 0), rep.get("live", 0),
                rep.get("cond", 0),
@@ -2571,6 +2622,37 @@ def unflatten_function(ea, do_apply=True):
         rep["decoy"] = True
         rep["skip_reason"] = ("jump-table decoy entry (live path does no work; "
                               "real body behind a computed-goto dispatcher)")
+        return rep
+    # Impure dispatcher: the binary-search tree carries hoisted side-effects
+    # (real `mov`/`lea` into argument/key registers wedged between a state
+    # compare and its jcc, e.g. `mov rdx, r12`). Unflattening rewrites each
+    # block straight to its successor head, bypassing the dispatcher -- which
+    # would silently drop those instructions and deliver the wrong register
+    # state to the work blocks (mis-resolved API calls, broken decompilation).
+    # Recovering them needs side-effect replay (planned Layer-2 work); until
+    # then we refuse to collapse the edges and leave the function dispatching,
+    # opaque-folding the dead parity gadgets for readability (always sound).
+    imp = r._impure_nodes()
+    if imp:
+        nse = sum(len(v) for v in imp.values())
+        rep["applied"] = False
+        rep["impure"] = len(imp)
+        rep["impure_instrs"] = nse
+        if do_apply:
+            rep["folded"] = OpaqueFolder(ea).apply().get("folded", 0)
+            rep["skip_reason"] = (
+                "dispatcher has %d impure node(s) carrying %d hoisted "
+                "side-effect instruction(s) (e.g. argument/key setup like "
+                "`mov rdx, r12`); collapsing edges would bypass them, so the "
+                "function is left dispatching; opaque-folded %d predicate(s) "
+                "instead" % (len(imp), nse, rep["folded"]))
+        else:
+            rep["would_fold"] = len(OpaqueFolder(ea).plan())
+            rep["skip_reason"] = (
+                "dispatcher has %d impure node(s) carrying %d hoisted "
+                "side-effect instruction(s); would leave dispatching and "
+                "opaque-fold %d predicate(s)"
+                % (len(imp), nse, rep["would_fold"]))
         return rep
     # Jump-table family: the computed-goto dispatcher is SHARED by every state,
     # so a single unresolved block keeps the whole compare tree (and thus the
