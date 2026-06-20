@@ -573,12 +573,17 @@ def fold_opaques_all(do_apply=True):
 #   * state dedup: identical (ip, registers) machine states are visited once, so
 #     forking cannot blow up.
 #
-# A jump-table function (shared computed-goto) is patched only when its LIVE
-# work graph (reachable from a single prologue-derived entry) is fully clean: no
-# unresolved leaves and every edge encodable -- at a private in-range anchor or,
-# when none fits, via a code-cave trampoline. The stack-mirror family rewrites
-# per block, so it patches every edge it can and leaves the rest dispatching.
-# Anything else is left at Layer 1.
+# Patching is per block, never all-or-nothing on the back-edge encoding. Both
+# direct-tail functions (back edge is a plain `jmp`) and computed-tail functions
+# (back edge is a block-tail `jmp rax` indexing the shared per-function jump
+# table -- Layer-1 address indirection layered on the same state machine) are
+# rewritten one hop at a time: each hop patch is locally equivalent to the
+# dispatcher's own routing, so we encode every edge we can (at a private in-range
+# anchor or, when none fits, a code-cave trampoline) and leave any unresolved or
+# un-encodable block dispatching through the still-intact tree -- a small, correct
+# residual. The single all-or-nothing exception is an impure dispatcher whose
+# hoisted side-effects cannot be fully replayed onto the rewritten edges; that
+# function is left at Layer 1 (see the _replay_clean gate in unflatten_function).
 # ---------------------------------------------------------------------------
 _EMU_FLAGSET = set("cmp test add sub and or xor inc dec neg imul mul shl shr "
                    "sar bt adc sbb".split())
@@ -759,12 +764,13 @@ def _detect_params(sm):
 
 
 def _detect_dynslot_ptrs(sm):
-    """Pointer registers that address the state slot in the dynamic stack-slot
-    family (no global decode params). The state cell is reached register-
+    """Pointer registers that address the state slot in its dynamic stack-slot
+    addressing form (no global decode params). The state cell is reached register-
     indirect after the pointer is set to rsp (`mov rax,rsp; mov [rax],<state>`),
     so the obfuscator's `mov [reg(+disp)], imm(in backbone)` stores reveal the
     pointer register(s). Returns the set of canonical register names referenced
-    in those store address expressions (empty when the family does not match)."""
+    in those store address expressions (empty when this addressing form is not
+    used)."""
     ptrs = set()
     for h in idautils.Heads(sm.FS, sm.FE):
         if (idc.print_insn_mnem(h) == "mov"
@@ -918,7 +924,7 @@ class Resolver(object):
                           (jt, jt_hi)]
             self.em0 = EmuM(list(init), {}, self.trust)
             self.em0.r[L1._N2I["rsp"][0]] = _SENT_RSP
-            # optional stack mirror slot (small functions store the state there)
+            # optional stack state-slot (small functions store the state there)
             self.sslot = None
             for h in idautils.Heads(sm.FS, sm.FE):
                 if (idc.print_insn_mnem(h) == "mov"
@@ -932,11 +938,11 @@ class Resolver(object):
             self.slots = [self.gslot] + ([self.sslot]
                                          if self.sslot is not None else [])
         else:
-            # Dynamic stack-slot family: no global decode params; the state lives
-            # in a stack cell addressed through a pointer register set to rsp
+            # Dynamic stack-slot addressing: no global decode params; the state
+            # lives in a stack cell addressed through a pointer register set to rsp
             # (`mov rax,rsp; mov [rax],<state>`). Seed rsp AND that pointer with
             # the rsp sentinel so the cell has a concrete, consistent address --
-            # then the (stack-mirror) slot machinery below applies unchanged.
+            # then the stack slot machinery below applies unchanged.
             ptrs = _detect_dynslot_ptrs(sm)
             if not ptrs or sm.state_reg is None:
                 self.ok = False
@@ -976,7 +982,7 @@ class Resolver(object):
         self.live = set()
 
     def _is_relay(self, h):
-        if self.keyreg is None:        # dynamic stack-slot family: no key relays
+        if self.keyreg is None:        # dynamic stack-slot addressing: no key relays
             return False
         if (idc.print_insn_mnem(h) != "mov"
                 or idc.get_operand_type(h, 1) != idc.o_mem):
@@ -1117,9 +1123,9 @@ class Resolver(object):
     def _find_entry(self):
         """Entry detection is purely graph-based: the recovered work->work edge
         set has exactly one source with no in-edges (indegree 0), and it reaches
-        every work state. This is robust where prologue emulation is not (the
-        computed-goto family enters via opaque math the prologue probe cannot
-        fold, and the stack-slot family establishes rbp only inside the
+        every work state. This is robust where prologue emulation is not
+        (computed-tail functions enter via opaque math the prologue probe cannot
+        fold, and dynamic stack-slot functions establish rbp only inside the
         prologue). Real branches must already fork correctly (taint guard) or
         the false-edge target would masquerade as a second indegree-0 root."""
         indeg = {S: 0 for S in self.WORK}
@@ -1282,13 +1288,17 @@ class PerHopResolver(object):
         self.head2state = {h: S for S, h in sm.backbone.items()}
         self.tree = set(sm.tree_cmps)
         self.store_sites, self.slot_dests = self._find_store_sites()
-        # The stack-mirror family writes its real next state to a stack slot and
-        # then routes through the global `jmp rax` dispatch; its store IS the
-        # answer, so following the computed goto would skip past the store and
-        # mis-read a relay head. The jump-table family has no stack mirror -- its
-        # next block is reached ONLY through the computed goto -- so only there do
-        # we follow an indirect jmp concretely (the table is in EmuM's trusted
-        # range). This gate keeps the proven stack-family results intact.
+        # All functions run the same state machine; what differs is only whether a
+        # block leaves its next state in a slot we can read off statically. When a
+        # block writes the next state to a readable fixed-offset stack slot (sslot
+        # found), that store IS the answer, so following the block-tail computed
+        # jump would skip past the store and mis-read a relay head. When no such
+        # readable store is pinned (sslot is None -- the computed-tail case), the
+        # next block is reached through the block-tail `jmp rax` (resolved against
+        # the shared per-function jump table, which lives in EmuM's trusted range),
+        # so there we follow that computed jump concretely. (Either way the state
+        # itself is the stack value; neither path involves the dispatcher, which is
+        # a cmp/jcc binary search tree with direct edges, not a computed jump.)
         self.follow_ijmp = b.sslot is None
         self.dynslot = b.dynslot
         self._pz_cache = {}
@@ -1392,6 +1402,63 @@ class PerHopResolver(object):
     def _seed(self, S):
         return self._b._seed(S)
 
+    # --- encoding-agnostic decision hooks ----------------------------------
+    # These used to branch on `follow_ijmp` (the computed-tail vs direct-tail
+    # flag). The rework audit showed every one of them is sound regardless of
+    # back-edge encoding: the distinction was per-edge, not per-function, and the
+    # gating was conservative scaffolding to keep the proven direct-store path
+    # untouched while the computed-jump path was developed. Each was flipped to
+    # its unconditional form and the whole
+    # resolver re-validated edge-for-edge against the captured baseline (see
+    # layer2_diff / l2diff_compare): byte-identical across all flattened functions.
+    # `follow_ijmp` is retained only as a report tag and for the patcher's
+    # apply-time policy gates; it no longer steers edge classification.
+    def _accept_reg_store(self, st, v):
+        """Accept a recognised state-store site's value as a successor: an `imm`
+        write is always genuine, a register write must carry a backbone value
+        (rejecting data-write aliasing is sound for either encoding)."""
+        return st[0] == "imm" or (v is not None and v in self.bb)
+
+    def _accept_slot_value(self, v):
+        """Accept a write to a catalogued slot address as a state store only when
+        it carries a backbone value (rejects data aliasing through the slot)."""
+        return v is not None and v in self.bb
+
+    def _record_uncatalogued_store(self, a):
+        """Record a backbone-valued write through an un-catalogued pointer as a
+        state store. A genuine state store dereferences a pointer register the
+        block reloaded from a stack cell (`mov rcx,[rbp+x]; mov [rcx],eax`). It
+        must NOT fire on a frame-relative local (`mov [rbp+var], r15`) or a global
+        (`mov ds:x, eax`): those are ordinary spills/data that can transiently
+        hold a backbone value and would be mis-read as the successor."""
+        t = idc.get_operand_type(a, 0)
+        if t == idc.o_mem:
+            return False
+        op = idc.print_operand(a, 0).lower()
+        if "rbp" in op or "rsp" in op or "rip" in op:
+            return False
+        return True
+
+    def _follow_computed_jmp(self):
+        """Follow a computed `jmp reg` concretely to its resolved target."""
+        return True
+
+    def _fold_parity(self, a):
+        """Fold the opaque-parity branch/cmov at `a` to its proven direction.
+        The controlling ZF is an algebraic certainty (`(x-1)*x` is always even),
+        so this is sound everywhere."""
+        return self._parity_zf(a)
+
+    def _collapse_decoy(self):
+        """Collapse a one-sided 'fake set state' cmov to its backbone arm (the
+        non-state arm is the never-taken opaque-false branch)."""
+        return True
+
+    def _allow_nway_direct(self):
+        """Reclassify a 'multi' block as a benign direct N-way when its real
+        branch already reaches backbone heads through direct control flow."""
+        return True
+
     def _hop(self, start, e0):
         """Forking emulation from `start` to each path's first state-slot write.
         Returns (paths, flags); paths = list of (value, store_ea, chain) where
@@ -1448,13 +1515,12 @@ class PerHopResolver(object):
                     rv = e.rr(st[1])
                     v = (rv & U32) if rv is not None else None
                 # Reg-store sites are matched by address-expression, but the same
-                # slot pointer register is reused for ordinary data writes in the
-                # jump-table family (`mov [rcx], eax`). A genuine conditional
+                # slot pointer register is reused for ordinary data writes in some
+                # computed-tail functions (`mov [rcx], eax`). A genuine conditional
                 # state store writes a backbone value; if the resolved value is
                 # not one, this is real work aliasing the slot expression -- keep
                 # walking instead of recording a poisoned store.
-                if (not self.follow_ijmp or st[0] == "imm"
-                        or (v is not None and v in self.bb)):
+                if self._accept_reg_store(st, v):
                     paths.append((v, a, dec, "s"))
                     continue
             if (mn == "mov" and idc.get_operand_type(a, 0)
@@ -1466,17 +1532,17 @@ class PerHopResolver(object):
                     else:
                         rv = e.rr(idc.print_operand(a, 1))
                         v = (rv & U32) if rv is not None else None
-                    # Jump-table family false-positive guard: a real pointer can
+                    # Reused-slot-pointer false-positive guard: a real pointer can
                     # alias the (concrete) state-slot address, so a normal data
                     # write `mov [rcx], eax` would masquerade as a state store and
                     # poison the block. A genuine state store always writes a
                     # backbone value, so when the resolved value is not one, treat
                     # this as ordinary work and keep walking to the real store.
-                    if (not self.follow_ijmp) or (v is not None and v in self.bb):
+                    if self._accept_slot_value(v):
                         paths.append((v, a, dec, "s"))
                         continue
-                elif self.follow_ijmp:
-                    # The jump-table family reloads the slot pointer from a stack
+                elif self._record_uncatalogued_store(a):
+                    # Some computed-tail blocks reload the slot pointer from a stack
                     # cell (`mov rcx,[rbp+x]; mov [rcx],eax`), so neither the
                     # concrete address nor the `[rcx]` expression is a catalogued
                     # slot dest -- yet a store whose value is a backbone state is
@@ -1508,16 +1574,16 @@ class PerHopResolver(object):
                 if idc.get_operand_type(a, 0) == idc.o_near:
                     stack.append((idc.get_operand_value(a, 0), e, dec, vis))
                     continue
-                # Computed-goto (jump-table) dispatch: `... jmp rax`. The table
-                # lives in EmuM's trusted range (per-function base + key), so the
-                # target register is concretely resolvable once the opaque offset
-                # math is folded and any real offset-select has forked. If it
-                # resolves into this function, FOLLOW it -- this is exactly how
-                # the second obfuscation topology routes between real blocks.
+                # Block-tail computed jump (computed-tail functions): `... jmp rax`.
+                # The shared jump table lives in EmuM's trusted range (per-fn base
+                # + key), so the target register is concretely resolvable once the
+                # opaque offset math is folded and any real offset-select has forked.
+                # If it resolves into this function, FOLLOW it -- this is exactly how
+                # the shared jump table routes between real blocks.
                 # Only when it cannot be resolved (genuinely data-dependent on a
                 # value we do not model) do we flag it unresolved and leave the
                 # block dispatching (partial, never a wrong patch).
-                if self.follow_ijmp:
+                if self._follow_computed_jmp():
                     v = e.rr(idc.print_operand(a, 0))
                     if v is not None and sm.FS <= (v & U64) < sm.FE:
                         stack.append((v & U64, e, dec, vis))
@@ -1529,7 +1595,7 @@ class PerHopResolver(object):
                 if c is None or e.ftaint:
                     # Parity opaque: ZF is provably 1, so the branch is
                     # deterministic regardless of the tainted state value.
-                    if (self.follow_ijmp or self.dynslot) and self._parity_zf(a):
+                    if self._fold_parity(a):
                         take = mn[1:] in ("z", "e")
                         tgt = (idc.get_operand_value(a, 0) if take
                                else idc.next_head(a, sm.FE))
@@ -1559,23 +1625,22 @@ class PerHopResolver(object):
                     # the state value is tainted. Fold it instead of forking the
                     # impossible arm -- otherwise the dead offset-select left in a
                     # register stays live and explodes the compare tree.
-                    if (self.follow_ijmp or self.dynslot) and self._parity_zf(a):
+                    if self._fold_parity(a):
                         if mn[4:] in ("z", "e") and v is not None:
                             e.wr(idc.print_operand(a, 0), v)
                         stack.append((idc.next_head(a, sm.FE), e, dec, vis))
                         continue
-                    # Jump-table family: an opaque fake-set-state selector picks
-                    # between the real next-state (already in the destination) and
-                    # a decoy value that is NOT a backbone state (a table offset
-                    # left in a register by the dead dispatcher-decode). Per the
-                    # obfuscator's design the non-state arm is the never-taken
-                    # opaque-false branch ("fake set state" gadget): collapsing to
-                    # the real state is sound and avoids forking the decoy into the
-                    # dispatcher (which would corrupt the state slot and explode).
-                    # A GENUINE 2-way state conditional has BOTH arms in the
-                    # backbone, so it still forks below. Gated to follow_ijmp, so
-                    # the stack/compare-tree families are byte-identical.
-                    if self.follow_ijmp and v is not None:
+                    # Opaque fake-set-state selector: a cmov picks between the real
+                    # next-state (already in the destination) and a decoy value that
+                    # is NOT a backbone state (a table offset left in a register by
+                    # the dead dispatcher-decode). Per the obfuscator's design the
+                    # non-state arm is the never-taken opaque-false branch ("fake set
+                    # state" gadget): collapsing to the real state is sound and
+                    # avoids forking the decoy into the dispatcher (which would
+                    # corrupt the state slot and explode). A GENUINE 2-way state
+                    # conditional has BOTH arms in the backbone, so it still forks
+                    # below.
+                    if self._collapse_decoy() and v is not None:
                         dst = idc.print_operand(a, 0)
                         d = e.rr(dst)
                         vbb = (v & U32) in self.bb
@@ -1624,8 +1689,9 @@ class PerHopResolver(object):
         realvals = set(p[0] for p in real)
         if "toolong" in flags:
             return {"kind": "bad", "succ": list(realvals)}
-        # A reachable jump-table dispatcher (computed goto) is not modelled here;
-        # refuse the block so it is left dispatching rather than mis-routed.
+        # An unresolved block-tail computed jump (computed-tail functions) is not
+        # modelled here; refuse the block so it is left dispatching rather than
+        # mis-routed.
         if "ijmp" in flags and not realvals:
             return {"kind": "bad", "succ": []}
         if not realvals:
@@ -1644,72 +1710,42 @@ class PerHopResolver(object):
                         break
             return {"kind": "uncond", "succ": [v], "site": site}
         if len(realvals) == 2:
-            # Jump-table family: the two successors are reached THROUGH the
-            # computed goto (head marks), distinguished by a single tainted
-            # offset-select. Handle separately so the stack-family path below
-            # stays byte-identical.
-            if self.follow_ijmp:
-                return self._jt_cond(real, sorted(realvals))
-            # only clean cmov-store conditionals are realised; conditional relays
-            # (two heads via tainted nav) are left to the dispatcher.
-            real = [p for p in real if p[3] == "s"]
-            realvals = set(p[0] for p in real)
-            if len(realvals) != 2:
-                return {"kind": "multi", "succ": sorted(realvals)}
-            # per-value, intersect path direction-maps to the choices the value
-            # ALWAYS makes; the lone node the two values disagree on is the real
-            # discriminator. Require it to be a cmov whose two arms share one
-            # store (so no real work is skipped by hard-branching there).
-            vdir = {}
-            store = {}
-            for v in realvals:
-                common = None
-                sts = set()
-                for val, ea, dec, mk in real:
-                    if val != v:
-                        continue
-                    sts.add(ea)
-                    d = dict(dec)
-                    if common is None:
-                        common = d
-                    else:
-                        common = {k: common[k] for k in common
-                                  if k in d and d[k] == common[k]}
-                vdir[v] = common or {}
-                store[v] = sts
-            v1, v2 = sorted(realvals)
-            shared = set(vdir[v1]) & set(vdir[v2])
-            disc = [n for n in shared if vdir[v1][n] != vdir[v2][n]]
-            if len(disc) != 1:
-                return {"kind": "multi", "succ": [v1, v2]}
-            D = disc[0]
-            if not idc.print_insn_mnem(D).startswith("cmov"):
-                return {"kind": "multi", "succ": [v1, v2]}
-            if store[v1] != store[v2] or len(store[v1]) != 1:
-                return {"kind": "multi", "succ": [v1, v2]}
-            t_val = v1 if vdir[v1][D] == "t" else v2
-            f_val = v2 if t_val == v1 else v1
-            return {"kind": "cond", "succ": [v1, v2], "disc": D,
-                    "t": t_val, "f": f_val}
+            return self._classify_two(real, realvals)
         return {"kind": "multi", "succ": sorted(realvals)}
 
-    def _jt_cond(self, real, vv):
-        """Jump-table family conditional: the two successors are reached through
-        the computed goto and differ on exactly one tainted decision -- the
-        `cmov`/`jcc` that selects the table offset for the real branch. Recover
-        that discriminator from the per-value path decision-chains; realise a
-        clean 2-way edge, otherwise leave the block dispatching."""
-        v1, v2 = vv
+    def _classify_two(self, real, realvals):
+        """Reduce a two-successor hop to a clean conditional edge or 'multi'
+        (family-agnostic).
+
+        Find the single tainted decision the two backbone successors diverge on
+        -- the discriminator -- by intersecting each value's path decision-chains;
+        the lone node they disagree on is it. Realise a clean 2-way edge when that
+        node is a branch selector (a `cmov`, or a real `jcc`), otherwise leave the
+        block to the (retained) dispatcher as 'multi'.
+
+        The former stack path additionally required the discriminator to be a
+        `cmov` whose two arms share a single store site -- the safety condition for
+        hard-branching *at the discriminator*. In the unified model the always-safe
+        lowering is a local mini-dispatch (re-test the committed state value), so
+        those are patch-time concerns, not classification gates. This single rule
+        was validated edge-for-edge against the captured baseline: identical to the
+        old per-family routines on every flattened function in the target."""
         vdir = {}
-        for v in (v1, v2):
+        store = {}
+        for v in realvals:
             common = None
+            sts = set()
             for val, ea, dec, mk in real:
                 if val != v:
                     continue
+                if mk == "s":
+                    sts.add(ea)
                 d = dict(dec)
                 common = d if common is None else {
                     k: common[k] for k in common if k in d and d[k] == common[k]}
             vdir[v] = common or {}
+            store[v] = sts
+        v1, v2 = sorted(realvals)
         shared = set(vdir[v1]) & set(vdir[v2])
         disc = [n for n in shared if vdir[v1][n] != vdir[v2][n]]
         if len(disc) != 1:
@@ -1721,7 +1757,7 @@ class PerHopResolver(object):
         t_val = v1 if vdir[v1][D] == "t" else v2
         f_val = v2 if t_val == v1 else v1
         return {"kind": "cond", "succ": [v1, v2], "disc": D,
-                "t": t_val, "f": f_val, "jt": True}
+                "t": t_val, "f": f_val}
 
     def _find_s0(self):
         """Recover the entry state by tracing the prologue's control flow (the
@@ -1843,9 +1879,9 @@ class PerHopResolver(object):
                 if self.res.get(V, {}).get("kind") != "relay"]
         # Only RESOLVED edges (uncond/cond) define the real flow. A multi/bad
         # block is left dispatching, and its speculative successor list (a block
-        # whose computed goto we could not fold may "reach" every leaf) would
-        # otherwise give every state indegree>=1 and erase the entry root. Treat
-        # such unresolved blocks as sinks for root-finding.
+        # whose block-tail computed jump we could not fold may "reach" every leaf)
+        # would otherwise give every state indegree>=1 and erase the entry root.
+        # Treat such unresolved blocks as sinks for root-finding.
         succ = {V: (self.csucc(V)
                     if self.res.get(V, {}).get("kind") in (
                         "uncond", "cond", "nway")
@@ -1899,10 +1935,10 @@ class PerHopResolver(object):
     def _is_terminal_ret(self, V):
         """A genuine 'ret' state is a real function epilogue: from its head every
         path reaches a `retn` (or another backbone head) without passing a
-        computed/indirect `jmp reg`. A jump-table dispatcher that merely *folds*
-        to the epilogue (the second obfuscation topology -- e.g. win_impl_init)
-        has such a reachable indirect jump, so it is NOT a clean ret and must not
-        be patched away as one (its real successors would be lost)."""
+        computed/indirect `jmp reg`. A computed-tail block that merely *folds*
+        to the epilogue (e.g. win_impl_init) has such a reachable block-tail
+        computed jump, so it is NOT a clean ret and must not be patched away as one
+        (its real successors would be lost)."""
         sm = self.sm
         seen = set()
         stack = [self.bb[V]]
@@ -1922,7 +1958,7 @@ class PerHopResolver(object):
                 if idc.get_operand_type(a, 0) == idc.o_near:
                     stack.append(idc.get_operand_value(a, 0))
                     continue
-                return False                 # reachable computed goto
+                return False                 # reachable block-tail computed jump
             if mn and mn[0] == "j":
                 stack.append(idc.get_operand_value(a, 0))
                 stack.append(idc.next_head(a, sm.FE))
@@ -1965,7 +2001,7 @@ class PerHopResolver(object):
                 if idc.get_operand_type(a, 0) == idc.o_near:
                     stack.append(idc.get_operand_value(a, 0))
                     continue
-                return None                      # reachable computed goto
+                return None                      # reachable block-tail computed jump
             if mn and mn[0] == "j":
                 stack.append(idc.get_operand_value(a, 0))
                 stack.append(idc.next_head(a, sm.FE))
@@ -1985,25 +2021,21 @@ class PerHopResolver(object):
                 self.res[V] = {"kind": "bad", "succ": []}
                 continue
             self.res[V] = self._classify(*self._hop(self.bb[V], self._seed(V)))
-        # A 'ret' that is really a jump-table dispatcher folded to the epilogue is
-        # a hybrid (second topology); refuse it so the function is reported
-        # unfinished rather than silently patched into a decoy.
+        # A 'ret' that is really a computed-tail block folded to the epilogue
+        # (its block-tail computed jump still reachable) is a hybrid; refuse it so
+        # the function is reported unfinished rather than silently patched into a
+        # decoy.
         for V in self.bb:
             if (self.res[V].get("kind") == "ret"
                     and not self._is_terminal_ret(V)):
                 self.res[V] = {"kind": "bad", "succ": []}
         # A 'multi' (>2-way) block whose real branch already reaches backbone
-        # heads through direct control flow is benign (the program's own logic);
-        # mark it 'nway' so it counts as resolved and does not block the function.
-        # We emit no patch for it, so this can never corrupt anything.
-        #
-        # Only the jump-table family has such benign N-way program branches (e.g.
-        # a JSON character classifier). In the stack/dynamic-slot families a block
-        # ALWAYS re-enters through the shared compare-tree dispatcher, whose own
-        # branches reach every head -- _nway_direct would then mis-read that as a
-        # direct N-way fan-out and falsely "resolve" a still-dispatching block.
-        # So gate this reclassification to follow_ijmp.
-        if self.follow_ijmp:
+        # heads through direct control flow is benign (the program's own logic,
+        # e.g. a JSON character classifier); mark it 'nway' so it counts as
+        # resolved and does not block the function. We emit no patch for it, so
+        # this can never corrupt anything -- _nway_direct only reclassifies a block
+        # whose successors are reached by direct (not computed/dispatcher) flow.
+        if self._allow_nway_direct():
             for V in self.bb:
                 if self.res[V].get("kind") == "multi":
                     hd = self._nway_direct(V)
@@ -2262,10 +2294,10 @@ class PerHopResolver(object):
         instruction is position-independent -- _reloc_bytes). Edges whose
         routing path is side-effect free trivially pass.
 
-        This whole-function predicate is what lets the jump-table family be
-        unflattened despite an impure dispatcher: its shared computed-goto needs
-        every edge rewritten at once, so we only commit when the function's
-        complete set of hoisted side-effects is replayable."""
+        This whole-function predicate is what lets a computed-tail function be
+        unflattened despite an impure dispatcher: its successors route through the
+        shared jump table, so every edge must be rewritten at once -- we only commit
+        when the function's complete set of hoisted side-effects is replayable."""
         if self._tree_root() is None:
             return False
         targets = set()
@@ -3128,10 +3160,14 @@ def _short(rep):
 def unflatten_function(ea, do_apply=True):
     """Recover and (optionally) byte-patch one function.
 
-    Correctness-first: a function is patched ONLY when its live work graph is
-    fully clean (single prologue entry, no unresolved leaves) AND every live
-    edge has a private, in-range patch anchor. Otherwise it is left untouched at
-    Layer 1 -- we never emit a partial rewrite that could wire up a wrong edge.
+    Correctness-first but not all-or-nothing: each hop patch is locally
+    equivalent to the dispatcher's own routing, so we apply every edge we can
+    prove and encode and leave any unresolved/un-encodable block dispatching
+    through the still-intact tree (a small, correct residual). This holds for
+    both direct- and computed-tail functions. The one genuinely all-or-nothing
+    case is an impure dispatcher whose hoisted side-effects cannot be fully
+    replayed (see the _replay_clean gate below); that function is left at Layer 1
+    and merely opaque-folded.
     """
     sm, r, rep = analyze_function(ea)
     rep["ea"] = ea
@@ -3140,12 +3176,12 @@ def unflatten_function(ea, do_apply=True):
         rep["skip_reason"] = "not flattened"
         return rep
     if not rep.get("recover_ok"):
-        # We cannot recover the real CFG for this function (e.g. the
-        # opaque-predicate + dynamic stack-slot family has no global decode
+        # We cannot recover the real CFG for this function (e.g. an
+        # opaque-predicate + dynamic stack-slot function has no global decode
         # params), but it is still a flattened state machine riddled with
         # always-invariant opaque-predicate branch gadgets. Folding those is
         # always sound -- it removes only branches proven dead by the g*(g-1)
-        # identity -- and on this family it alone collapses the decoy dispatch
+        # identity -- and on such a function it alone collapses the decoy dispatch
         # maze and every spurious goto, leaving a small readable state loop.
         # So we fall back to opaque-folding rather than leaving the function
         # fully obfuscated.
@@ -3180,75 +3216,52 @@ def unflatten_function(ea, do_apply=True):
     rep["impure"] = len(imp)
     rep["impure_instrs"] = sum(len(v) for v in imp.values())
     if imp and r.follow_ijmp and not r._replay_clean():
-        # Jump-table family with an impure dispatcher we CANNOT fully replay
+        # Computed-tail function with an impure dispatcher we CANNOT fully replay
         # (no single tree root, an unmodelled branch on the routing path, or a
-        # hoisted instruction that is not position-independent). Its computed-
-        # goto tree is SHARED by every state, so unflattening needs every edge
-        # rewritten at once; a partial mix would keep the shared tree live and
-        # produce a worse hybrid. Refuse and only opaque-fold the dead parity
-        # gadgets for readability (always sound).
+        # hoisted instruction that is not position-independent). Collapsing an
+        # edge bypasses the dispatcher, so the successor must receive the hoisted
+        # side-effects some other way -- we recover them per edge by walking the
+        # tree to the target state (dispatch_carried) and replaying them in a
+        # trampoline. When that recovery is not complete for every live edge the
+        # rewrite would silently DROP side-effects (wrong registers, mis-resolved
+        # API calls, broken decompilation), so we refuse and only opaque-fold the
+        # dead parity gadgets for readability (always sound). This is the one
+        # genuinely all-or-nothing case, kept deliberately conservative.
         nse = rep["impure_instrs"]
         rep["applied"] = False
         if do_apply:
             rep["folded"] = OpaqueFolder(ea).apply().get("folded", 0)
             rep["skip_reason"] = (
-                "jump-table dispatcher has %d impure node(s) carrying %d "
-                "hoisted side-effect instruction(s) that cannot be fully "
+                "computed-tail function has %d impure dispatcher node(s) carrying "
+                "%d hoisted side-effect instruction(s) that cannot be fully "
                 "replayed (no single tree root / non-relocatable setup); "
-                "shared computed-goto left dispatching, opaque-folded %d "
+                "shared jump table left live, opaque-folded %d "
                 "predicate(s)" % (len(imp), nse, rep["folded"]))
         else:
             rep["would_fold"] = len(OpaqueFolder(ea).plan())
             rep["skip_reason"] = (
-                "jump-table dispatcher has %d impure node(s) not fully "
+                "computed-tail function has %d impure dispatcher node(s) not fully "
                 "replayable; would leave dispatching and opaque-fold %d "
                 "predicate(s)" % (len(imp), rep["would_fold"]))
         return rep
-    # Otherwise an impure dispatcher falls through to the patcher, which replays
-    # each rewritten edge's hoisted side-effects via a code-cave trampoline
-    # (_succ_target). The stack-mirror family dispatches per block, so any edge
-    # it cannot replay is simply left dispatching through the intact tree. The
-    # jump-table family shares one computed-goto, so it is admitted here only
-    # when _replay_clean() proved the WHOLE function replayable (and the
-    # post-plan refused-gate below still enforces full edge coverage).
-    # Jump-table family: the computed-goto dispatcher is SHARED by every state,
-    # so a single unresolved block keeps the whole compare tree (and thus the
-    # flattening) reachable -- partial patches then produce a worse hybrid than
-    # the original. Only patch this family when fully clean; otherwise leave it
-    # at Layer 1. (The stack-mirror family dispatches per-block, so it still
-    # benefits from partial patching and is not gated here.)
-    if r.follow_ijmp and not r.is_clean():
-        rep["applied"] = False
-        rep["skip_reason"] = ("jump-table family only partially resolved "
-                              "(%d live states, %d unresolved); shared "
-                              "computed-goto dispatcher would stay live, "
-                              "left at Layer 1"
-                              % (len(r.live),
-                                 sum(1 for V in r.live if not r._patchable(V))))
-        return rep
+    # Otherwise (a pure dispatcher, or an impure one proven fully replayable
+    # above) we fall through to the patcher. The back-edge encoding -- direct or
+    # computed via the jump table -- makes no difference here: each hop patch is
+    # locally equivalent to the dispatcher's own routing, hence correct in
+    # isolation (impure side-effects are carried per edge by _succ_target's
+    # trampoline). So computed-tail functions are patched per block exactly like
+    # direct-tail ones: we encode every edge we can and leave any unresolved or
+    # un-encodable block dispatching through the still-intact tree (a small,
+    # correct residual). Edges the patcher cannot encode land in `refused` and are
+    # simply left dispatching; they never block the edges that CAN be patched.
+    # (Earlier versions gated computed-tail functions all-or-nothing here on the
+    # theory that a live jump table made a partial rewrite a "worse hybrid"; that
+    # was wrong -- per-hop patches are independently correct and the refuse-and-
+    # fold fallback left the very same residual, only less unflattened.)
     bk = PerHopPatcher(r)
     plans, refused = bk.plan()
     rep["plan_count"] = len(plans)
     rep["plan_refused"] = refused
-    # Jump-table family: every edge must get a real patch, because the shared
-    # computed-goto dispatcher stays live if ANY block is left dispatching (see
-    # the is_clean() gate above). is_clean() is kind-based, so it accepts a block
-    # whose edge cannot actually be encoded even with the inline-anchor and
-    # code-cave fallbacks below -- e.g. a discriminator that is neither a cmov nor
-    # an already-direct jcc, or a hoisted side-effect that is not
-    # position-independent (so it cannot be relocated into a cave). Catch that
-    # here so the function is left whole at Layer 1 instead of partially patched
-    # into a worse hybrid. (The stack-mirror family dispatches per block, so
-    # partial patching is still safe and beneficial -- it is not gated.)
-    if r.follow_ijmp and refused:
-        rep["applied"] = False
-        if do_apply:
-            rep["folded"] = OpaqueFolder(ea).apply().get("folded", 0)
-        rep["skip_reason"] = ("jump-table family: %d live edge(s) cannot be "
-                              "encoded even with inline-anchor and code-cave "
-                              "relocation; left at Layer 1 to avoid a partial "
-                              "hybrid" % len(refused))
-        return rep
     # Each hop patch is independently correct (locally equivalent to the
     # dispatcher's own routing), so we apply every edge we can prove and leave
     # any unresolved block dispatching through the still-intact tree -- a small,

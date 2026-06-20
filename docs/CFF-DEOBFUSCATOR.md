@@ -475,7 +475,7 @@ arithmetic that nothing else needs), so the patch can't corrupt real code.
 
 **The outcome.** The arrows are back. IDA can now draw the full flow chart and
 the decompiler can read the whole function — though it is still *flattened* (a
-hub with 257 spokes). That's Layer 2's job.
+hub with 28 spokes, one per state). That's Layer 2's job.
 
 ---
 
@@ -556,12 +556,16 @@ flowchart LR
     before -->|Layer 2| after
 ```
 
-**Correct, not clever (again).** For the trickier "computed-goto" family, the
-shared dispatcher stays alive if *any* block is left unresolved, so the plugin
-patches such a function only when it can recover it **completely**; otherwise it
-leaves it at the (already improved) Layer-1 state rather than produce a
-half-rewritten mess. This is why, on a clean run, a handful of the hardest
-functions are reported as "skipped" instead of being mangled.
+**Correct, not clever (again).** Each hop patch is *locally* equivalent to what
+the dispatcher would have done, so it is correct in isolation — which means the
+plugin never has to be all-or-nothing: it patches every edge it can prove and
+encode and leaves any block it can't dispatching through the still-intact tree (a
+small, correct residual). This is true whether a block's back edge is a plain
+`jmp` or a computed jump through the shared jump table. The *one* function it
+refuses outright is an **impure dispatcher** whose hoisted side-effects it cannot
+fully replay (§3.2.6) — patching there would silently drop real work, so it is
+left at the already-improved Layer-1 state instead. That is why, on a clean run, a
+couple of the hardest functions are reported as "skipped" rather than mangled.
 
 **The outcome.** The hub-and-spokes collapses back into the readable tree from
 §1.3, and the spurious `if`s are gone.
@@ -665,16 +669,48 @@ We take them in order, because that is the order they must run in (Part 2.1).
 
 ### 3.1 Layer 1 — `jmp rax` de-indirection
 
-**Recap of the target.** Layer 1 deals with the indirect jump: the function is
-chopped into fragments, and each fragment ends with `jmp rax` (or `jmp rcx`,
-etc.) where the destination has been *computed* by a little block of arithmetic
-called a **decode gadget**. IDA cannot draw the edge because it does not know the
-value of `rax` at that point. Our job: figure out that value, then replace the
+**Recap of the target.** Layer 1 removes one specific piece of *infrastructure*:
+the **computed jump**. In the functions that use it, each block ends with
+`jmp rax` (or `jmp rcx`, …) whose destination has been built at run time by a
+little block of arithmetic — a **decode gadget** — that reads an encoded entry
+out of a per-function **jump table** and un-blinds it with keys the prologue
+loaded. IDA cannot draw the edge because it does not know the value of `rax`
+there. Our job: replay that arithmetic, recover the value, and replace the
 computed jump with a plain, direct jump that IDA *can* follow.
 
-There are two halves to this: a **resolver** that figures out where each jump
-goes, and a **patcher** that rewrites the bytes. The resolver is built on a tiny
-CPU emulator, so we start there.
+**This layer is not universal — and that scoping matters.** Of the 290 flattened
+functions in the sample, only **33** actually use computed jumps; the jump table
+is *their* indirection substrate. The other **257** never indirect at all: a
+block simply stores its next state and jumps **directly** to the dispatcher
+(`mov [slot], STATE ; jmp loc_dispatcher`), and the dispatcher itself is a direct
+`cmp`/`jcc` tree. For those functions Layer 1 has nothing to resolve and is
+skipped — they go straight to Layer 2. So read this section as *"how we peel away
+the jump-table indirection where it exists,"* not as a step every function takes.
+The 33 are also the heavyweights (`main`, `chromium_extract`, `firefox_extract`,
+`reg_read_str`, …), so the work this layer does is small in count but large in
+impact.
+
+Those counts are measured *after* a Layer 1 pass, and the ordering is not a mere
+technicality: Layer 1 can itself **reveal** flattened functions. When a function's
+dispatcher and state constants sit in bytes that no edge reaches yet, IDA leaves
+them as data — the scaffolding is invisible and the function does not even
+register as flattened. Resolving its computed jumps (and promoting the hidden
+targets, §3.1.5) materializes that region as code, and the state machine appears.
+`sub_1401D8D90` is exactly this case: on the raw image it shows zero state
+constants, but after Layer 1 it resolves to a 9-state dispatcher — one of the 33.
+
+One boundary is worth fixing up front. Layer 1 is **purely about addresses**: it
+turns a computed jump back into a direct one and nothing more. Everything the
+obfuscator builds *on top* of the resolved edges — the state slot, the dispatcher
+tree, and the conditional OR-of-`cmov` state selection — is **Layer 2's** concern
+(§3.2). In particular the `cmov`s inside a decode gadget here are *opaque
+predicates* (always-taken/never-taken, used to pad the index arithmetic); the
+*other* use of `cmov` — picking between two real successor states — is a Layer 2
+construct and is not in scope here.
+
+There are two halves to it: a **resolver** that figures out where each jump goes,
+and a **patcher** that rewrites the bytes. The resolver is built on a tiny CPU
+emulator, so we start there.
 
 #### 3.1.1 The micro-emulator: a pocket calculator for one register
 
@@ -791,6 +827,24 @@ produces a concrete number:
 
 The emulator lands on `rax = 0x140088c49`. That is the real successor block.
 (Confirmed live: `resolve(0x140088b80) -> 0x140088c49`.)
+
+**One table, shared by every block in the function.** The pointers this gadget
+uses (`off_140307B20/B28/B30`) are not per-block — they name a single jump table
+that *all* of this function's block tails index. In `reg_read_str`, **109** tail
+sites read the same table; each computes its own index and pulls its own entry.
+"Shared" therefore means *shared across the blocks of one function*, not across
+functions: each function carries private decode keys (`r15`/`r13`/`r12`) and its
+own table slice, which is why only `reg_read_str` references these particular
+globals.
+
+A subtlety that matters for how Layer 1 and Layer 2 divide the work: Layer 1 does
+not know — and does not care — *what kind* of target a table entry decodes to. In
+this function the vast majority of entries decode straight to the next real block
+(a direct successor); a small minority decode to the **dispatcher entry** (a
+`mov eax, [slot]` that reloads the state and walks the `cmp/jcc` tree). Either way
+Layer 1's job is identical: recover the address and lay down a direct jump. Which
+of those two an edge turned out to be — ordinary successor vs. re-entry into the
+state machine — is a question only Layer 2 asks.
 
 #### 3.1.4 From one jump to the whole function: the fixpoint analyzer
 
@@ -955,19 +1009,23 @@ in order:
 3. **Resolve each hop** — from a block, where does control *really* go next?
 4. **Rewrite** — turn each state-write into a direct jump, then clean up.
 
-With those four solved, §3.2.6 opens up the dispatcher itself — the two
-"families" of state machine this sample uses, and the one case where the
-dispatcher does real work that the rewrite must preserve. The last three
-subsections cover the supporting machinery that makes the rewrite safe in
-practice: the **code cave** that houses relocated patches (§3.2.7), the **entry
-redirect** that must not trample the prologue (§3.2.8), and the final
-opaque-predicate **fold** (§3.2.9).
+With those four solved, §3.2.6 opens up the dispatcher itself — its tree
+structure, the two kinds of block edge, the single axis on which functions
+actually differ (a Layer-1 address indirection on the back edge, present in 33
+functions and absent in the other 257), and the one case where the dispatcher
+does real work that the rewrite must preserve. The last three subsections cover
+the supporting machinery that makes the rewrite safe in practice: the **code
+cave** that houses relocated patches (§3.2.7), the **entry redirect** that must
+not trample the prologue (§3.2.8), and the final opaque-predicate **fold**
+(§3.2.9).
 
 Throughout, we use `reg_read_str` again. Its real, recovered facts (read live
 from the database) are: the state register is **`eax`**, there are **28 states**
 wired together by a **39-comparison** dispatcher tree, the entry state is
-**`0xD5FD561C`**, and the state value is decoded from the global at
-`off_140307B20` using the key in `r15` (`0x489B85B10A15A8C7`).
+**`0xD5FD561C`** (written straight into the stack state-slot by the prologue), and
+its block-tail computed jumps are decoded with the key in `r15`
+(`0x489B85B10A15A8C7`) — that key is Layer-1 address infrastructure, not the
+state (see §3.2.2).
 
 #### 3.2.1 Finding the state machine (`StateMachine`)
 
@@ -1014,28 +1072,36 @@ distinct target blocks — this avoids mistaking an ordinary compiler `switch`
 
 #### 3.2.2 Understanding the decode: where the state lives
 
-To resolve a hop we must *read the state the way the program does*. In this
-sample the state is not a simple stack variable — it is kept in a global buffer,
-and the address is itself obfuscated:
+To resolve a hop we must *read the state the way the program does* — so the first
+job is to find where the dispatch state actually lives. Measured across the whole
+sample, the answer is the same in **every** flattened function: the state lives in
+a **per-invocation stack slot**. A block writes its successor there as a plain
+immediate (`mov [slot], 0x9E454962`), and the dispatcher reloads it from that slot
+before walking the tree. There is no global state cell.
 
-```asm
-mov  rbx, cs:off_140307B20     ; base pointer from a global
-mov  eax, [rbx + r15]          ; state = *(base + key)    (r15 = 0x489B85B10A15A8C7)
-```
+The slot is *addressed* one of two ways, and the difference is cosmetic:
 
-The plugin recovers the **base global** (`off_140307B20`) and the **key
-register** (`r15`), reads the base value out of the file, adds the key, and gets
-the real address of the state cell — for `reg_read_str` that is `0x14035C70C`.
-Two neighbouring globals (at base+8 and base+16) decode the same way into an
-"operand" buffer and the computed-goto **jump table**. These three regions are
-recorded as **trusted memory** — addresses that belong to the dispatcher
-machinery rather than to the program's real data. (That distinction is the key to
-the next step.) The plugin handles three ways this state cell can be *addressed*:
-the **global base+key** form above; a **stack-mirror** form where the next state
-is also written to a stack cell; and a **dynamic stack-slot** form reached through
-a pointer register. (These addressing forms line up with the dispatcher
-"families" we dissect in §3.2.6, which is where the distinction starts to matter.)
-`reg_read_str` uses the stack-mirror form.
+- a **fixed frame offset** — `reg_read_str` uses `[rbp+50h+var_3C]`;
+- a **dynamic** location — most of the unnamed `sub_*` helpers copy the stack
+  pointer into a scratch register in the prologue (`mov rax, rsp`) and store
+  through it (`mov [rax], 0x…`), so the cell is wherever `rsp` happened to land.
+
+For the emulator the dynamic form needs one trick: it gives `rsp` a fixed
+stand-in value — a **sentinel** — and copies that into the scratch register, so
+every store and load of the cell resolves to the *same* concrete address. The real
+runtime address is irrelevant; only consistency matters.
+
+What, then, of the obfuscated **global base+key** reads from Layer 1
+(`mov rbx, cs:off_140307B20 ; mov eax, [rbx+r15]`, `r15 = 0x489B85B10A15A8C7`)?
+Those are **not** the state — they are Layer-1 decode infrastructure. The three
+globals at `off_140307B20/B28/B30` decode (base+key) into the operand data the
+opaque predicates consume (§3.2.3) and the per-function **jump table** that
+block-tail computed jumps index (§3.1.3). The plugin records those regions as
+**trusted memory** so the emulator may read them to fold predicates and resolve
+jumps — but the value the dispatcher branches on is the stack slot, full stop.
+(An earlier draft of this guide called `0x14035C70C` "the state cell"; it is in
+fact one of these Layer-1 operand regions. The state is, and always was, on the
+stack.)
 
 #### 3.2.3 The crux: telling opaque branches from real ones (`EmuM`)
 
@@ -1094,7 +1160,7 @@ Each hop is then **classified**:
 | `relay` | reached the next block with no write of its own | compose it away |
 | `ret` | the path reaches a real function return | leave it (already terminal) |
 | `nway` / `multi` | a >2-way real branch (e.g. a character classifier) | only kept if it already jumps to real blocks; else left dispatching |
-| `bad` | unresolved within budget, or an unmodelled computed goto | **leave dispatching** (safe residual) |
+| `bad` | unresolved within budget, or an unmodelled block-tail computed jump | **leave dispatching** (safe residual) |
 
 Why per-hop is sound: the obfuscator's own dispatcher would have done exactly
 this routing — read the state the block wrote, jump to that block. Replacing the
@@ -1185,16 +1251,17 @@ flowchart TD
     S -- "no" --> X["refuse: leave dispatching"]
 ```
 
-Above this per-edge work sit two **whole-function** decisions — when to patch a
-function at all, and how to handle a dispatcher that does real work. Both depend
-on which *family* the dispatcher belongs to, so we look at families next.
+Above this per-edge work sits one **whole-function** wrinkle: occasionally the
+dispatcher does real work of its own, which must be handled before the edges
+through it can be rewritten. Sorting that out means finally opening up the
+dispatcher, which we do next.
 
-#### 3.2.6 The dispatcher up close: families and hoisted side-effects
+#### 3.2.6 The dispatcher up close: edges, encodings, and hoisted side-effects
 
 So far we have treated the dispatcher as a black box: "it reads the state and
-jumps to the right block." To explain the last few wrinkles — why some functions
-can be cleaned up one edge at a time while others are all-or-nothing, and why a
-handful need extra care — we have to open that box.
+jumps to the right block." To explain the last few wrinkles — how a block hands
+off to the next, and why a handful of dispatchers need extra care — we have to
+open that box.
 
 **What the dispatcher actually is.** It is not a single table lookup. It is a
 **binary search tree** of compare-and-branch instructions that narrows the state
@@ -1246,40 +1313,19 @@ two kinds of edge, and every flattened function uses just these:
 
 That is the entire skeleton: **a block does its work, names a successor state, and
 the tree dispatches to the block that owns that state** — repeated until a block
-returns. It is identical across every flattened function in the binary. Everything
-below is variation on *how* a block records that successor, and how we recover it.
+returns. It is identical across every flattened function in the binary, and so is
+where the state lives (the stack slot of §3.2.2). The one thing that varies is
+spelled out next.
 
-**The variants: how a block records its successor.** What differs between functions
-is whether a block leaves its successor somewhere we can *read* without running the
-code. That single difference sorts them into two families and decides whether we
-can clean them up one edge at a time.
+**The only axis of variation: the block-tail transfer.** Having named its
+successor state, a block must hand control back to the dispatcher. There are
+exactly two encodings of that back edge, and that is the *sole* structural
+difference between flattened functions:
 
-- **Stack-mirror family** (e.g. `reg_read_str`). The block *mirrors* its successor
-  state into a fixed stack slot — `mov [slot], 0x9E454962` — so the answer sits
-  right there in the block. We read it straight off the store, however the block
-  then loops back to the dispatcher. And because every block carries its own
-  readable store, we can rewrite blocks **one at a time**: an untouched block
-  simply keeps dispatching, so partial progress is always safe.
-
-  The most common shape in this binary is a minor variant. Instead of a slot at a
-  *fixed* stack offset (like `reg_read_str`'s `[rbp+0x94]`), the bulk of the
-  unnamed `sub_*` helpers keep the state cell at a **dynamic** stack location: the
-  prologue copies the stack pointer into a scratch register (`mov rax, rsp`) and
-  every block stores the state through that register (`mov [rax], 0x…`). The cell's
-  address is therefore wherever `rsp` happened to point — not a constant the plugin
-  can read off statically.
-
-  That only complicates the *emulator*, which needs a concrete address to track the
-  cell. It gives `rsp` a fixed stand-in value — a **sentinel** — and copies that
-  same value into the scratch register (mirroring the prologue's `mov rax, rsp`).
-  The real runtime stack address is irrelevant; all that matters is that every
-  store and load of the cell now resolves to the *same* concrete address. With the
-  cell pinned that way, the per-block machinery is identical, and these functions
-  unflatten exactly like `reg_read_str`.
-- **Jump-table family** (e.g. `decrypt_aes_gcm`). The successor is **not** left as
-  a readable constant. An unconditional edge has its successor's *address* baked
-  into a shared **jump table** and jumps straight there, bypassing the tree for
-  that one hop:
+- **Direct (257 functions).** The block jumps straight to the dispatcher:
+  `mov [slot], NEXT ; jmp loc_dispatcher`. Nothing is concealed.
+- **Computed (33 functions).** The back edge is an indirect `jmp rax` whose target
+  *address* is decoded from the shared per-function **jump table** (§3.1.3):
 
 ```asm
 14015c378  mov   rax, [key + offset + table_base]  ; load ENCODED successor address
@@ -1287,45 +1333,50 @@ can clean them up one edge at a time.
 14015c37f  jmp   rax                                ; straight to the successor block
 ```
 
-  (`offset` is a constant — the surrounding `cmov`s look conditional but are forced
-  by an opaque parity predicate, §3.2.3.) Conditional edges still pick a successor
-  *state*, but write it through a register-relative slot we cannot pin to a fixed
-  address. Either way there is no readable store, so the only handle on an edge is
-  to **follow** the computed jump (which Layer 1 already resolved, §2.1).
+  This is **Layer-1 indirection layered on top of the very same state machine**.
+  It hides the *edge address*; it has nothing to do with the state (which is still
+  the immediate written to the stack slot) and nothing to do with the dispatcher
+  (still a tree of *direct* `cmp`/`jcc` branches — never a `jmp rax`).
+
+That is the whole difference: not two kinds of state machine, and not a question of
+where state lives, but one machine that, in 33 functions, wears an extra
+address-indirection on its back edge.
+
+> **A retired distinction.** Earlier versions of this guide (and the code's
+> internal flag names) split flattened functions into "stack-mirror," "jump-table,"
+> and "dynamic-stack-slot" *families*. That taxonomy was a misdiagnosis. "Stack
+> mirror" and "jump table" turned out to be the *same* 33 functions described from
+> two angles — where the state sits vs. how the back edge is encoded — with the
+> false implication that the jump table carried state. "Dynamic-stack-slot" was
+> merely a stack-*addressing* style (a scratch register vs. a frame offset), shared
+> by direct and computed functions alike. Stripped of the confusion, there is one
+> state machine and one binary axis: **back edge direct, or computed via the jump
+> table.** That axis is real — it is exactly what Layer 1 removes — but it is the
+> *only* one, and by Layer 2 it no longer changes how a function is patched: direct-
+> and computed-tail functions are both rewritten per hop, identically.
+
+**How we recover an edge.** Either encoding recovers the same way: emulate the
+block to its hand-off and read the successor off the `mov [slot], NEXT` store. For
+the 33 computed-tail functions Layer 1 has already rewritten the live `jmp rax`
+into a direct `jmp loc_successor` (§2.1), and following that jump lands on exactly
+the block the stored state maps to — store-based and jump-based recovery agree
+edge-for-edge (we verified this byte-for-byte across the whole sample). One
+wrinkle in some computed-tail functions: the slot-pointer register is also reused
+for ordinary data writes, so a `mov [rcx], eax` is not *always* a state store; the
+emulator distinguishes a genuine state store from incidental data by **value**
+(does it match a known state?), not by location. Once every block's edge is a
+clean `state → state`, the dispatcher is left unreferenced and falls away.
 
 ```mermaid
 flowchart LR
-    subgraph SM["stack-mirror: read the state off a slot"]
+    subgraph U["one state machine — all 290 flattened functions"]
       direction TB
-      b1["block"] -->|"mov [slot], NEXT<br/>(readable mirror)"| d1["dispatcher<br/>reads slot, walks tree"]
-      d1 --> n1["next block"]
-    end
-    subgraph JT["jump-table: follow the shared table"]
-      direction TB
-      b2["block"] -->|"compute index"| g["shared jump table<br/>(encoded block addresses)"]
-      b3["block"] -->|"compute index"| g
-      g -->|"load slot + decode (+key)"| n2["next block"]
+      blk["block: mov [stack slot], NEXT"] --> tail{"back-edge encoding"}
+      tail -->|"direct jmp (257)"| disp["dispatcher:<br/>reload slot, walk cmp/jcc tree"]
+      tail -->|"computed jmp via jump table<br/>— Layer 1 indirection (33)"| disp
+      disp --> nxt["next block"]
     end
 ```
-
-**How we recover an edge, and why one family is all-or-nothing.** The plugin
-emulates each block to its hand-off (§3.2.3): for the stack-mirror family it reads
-the successor off the store; for the jump-table family it replays the table
-arithmetic and follows the jump. Either way the buried hand-off becomes a clean
-`state → state` edge. The families part ways on whether edges can be retired
-**independently**:
-
-- **Stack-mirror is per-edge.** Each block's successor is a self-contained local
-  fact, so rewriting one block to jump straight to its successor is correct on its
-  own — the dispatcher stays live and keeps routing the blocks we have not touched.
-  We patch every edge we can and leave the rest dispatching; partial is a strict
-  improvement.
-- **Jump-table is all-or-nothing.** There is no independent per-edge handle: a
-  successor exists only *through* the one shared computed-goto. The flattening can
-  be retired only by resolving the whole set at once — leave a single block on the
-  shared goto and the entire structure stays live, a hybrid worse than the
-  untouched original. So the plugin patches this family only when it can place
-  **every** live edge.
 
 **When the dispatcher does real work: "impure" dispatchers.** Everything above
 assumes the dispatcher is *pure routing* — read the state, search, jump, touching
@@ -1377,16 +1428,14 @@ Two guard-rails keep replay honest:
   must execute identically from the cave, so anything rip-relative or absolute is
   refused rather than copied to an address where its bytes would compute the
   wrong target. This relocation check is shared cave machinery, covered in §3.2.7.
-- **The family sets the terms.** The stack-mirror family replays per edge and
-  leaves anything it can't relocate dispatching — a correct partial result. The
-  jump-table family, being all-or-nothing, is unflattened only when a
-  whole-function check (`_replay_clean`) proves *every* edge's hoisted work is
-  recoverable and relocatable. When it holds — as for `decrypt_aes_gcm`, whose
-  dispatcher hoists eight `mov rcx/rdx, [rbp+…]` argument loads — the function
-  unflattens completely, shared dispatcher and all. When it doesn't (no single
-  tree root, a rip-relative hoisted `lea`, or a conditional edge with no room for
-  its patch), the function is left dispatching and merely opaque-folded. Same
-  stance as always: a correct, still-flattened function beats a wrong, pretty one.
+- **Replay must be complete.** A shared dispatcher's hoisted work is recovered
+  only when *every* hoisted instruction is both reconstructable and
+  position-independent enough to relocate (the `_replay_clean` check). When it is
+  — as for `decrypt_aes_gcm`, whose dispatcher hoists eight `mov rcx/rdx, [rbp+…]`
+  argument loads — the function unflattens completely, shared dispatcher and all.
+  When it isn't (no single tree root, or a rip-relative hoisted `lea`), the plugin
+  leaves the function dispatching and merely opaque-folds it: a correct, still-
+  flattened function beats a wrong, pretty one.
 
 #### 3.2.7 The code cave: a home for relocated patches
 
@@ -1520,10 +1569,9 @@ Because `x*(x-1)` being even is an algebraic certainty — not a guessed value �
 this rewrite is provably correct. The now-dead parity arithmetic feeds nothing,
 Hex-Rays drops it, and the spurious branches vanish. This same fold also doubles
 as a **standalone fallback** for any function the plugin deliberately leaves
-dispatching — chiefly an all-or-nothing jump-table function whose shared jump
-table it can't fully recover (§3.2.6). Folding the opaque maze alone still
-collapses most of the clutter into a readable loop, even with the dispatcher left
-in place.
+dispatching — one whose dispatcher it can't fully recover. Folding the opaque maze
+alone still collapses most of the clutter into a readable loop, even with the
+dispatcher left in place.
 
 **The outcome.** With the live edges direct, the dispatcher unreferenced, and the
 opaque branches folded, `reg_read_str`'s 28-state hairball collapses back into the

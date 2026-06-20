@@ -63,7 +63,7 @@ specific:
 | --- | --- | --- |
 | Orchestration | Multi-pass driver, netnode idempotency / run-state, dry-run vs full-run split, console reporting, "resolve by emulation, refuse rather than guess, only overwrite provably-dead bytes" discipline | — |
 | **Layer 1** | Constant micro-emulation to resolve computed `jmp <reg>` | Decode-gadget mnemonic set, "safe-to-overwrite" tail mnemonics (`add/mov/lea/nop`), Win64 volatile-register assumptions |
-| **Layer 2** | The opaque-predicate fold is algebraically sound in general | 32-bit state variable in a stack slot; dispatcher as a **signed binary-search compare tree** (`cmp eax, IMM; jg/jle` interior, `cmp eax, STATE; jz/jnz` leaves); the **parity gadget** `lea Rd,[Rs-1]; imul Rd,Rs; test Rd,1; jz/jnz`; the stack-mirror vs. jump-table dispatch families |
+| **Layer 2** | The opaque-predicate fold is algebraically sound in general | 32-bit state variable in a stack slot; dispatcher as a **signed binary-search compare tree** (`cmp eax, IMM; jg/jle` interior, `cmp eax, STATE; jz/jnz` leaves); the **parity gadget** `lea Rd,[Rs-1]; imul Rd,Rs; test Rd,1; jz/jnz`; the direct vs. computed (jump-table) back-edge encodings |
 | **Layer 3** | Keys are **discovered dynamically** (`collect_keys` + family-consistency in `build_blind_map`), not hardcoded | The additive-blind call scheme `mov reg, cs:off; add reg, KEY; call reg`; `.bss` runtime-filled imports labeled `p_<API>` / `__imp_<API>` |
 
 A different flattener (e.g. an OLLVM-style switch dispatcher) would not match
